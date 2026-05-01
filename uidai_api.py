@@ -54,12 +54,16 @@ class UIDaiSession:
         self._fullname: str = ""
         self._captcha_token: str = ""
 
-    async def start(self, headless: bool = True):  # headless param kept for API compat
+    async def start(self, headless: bool = True, proxy: str = ""):
+        # proxy format: "http://user:pass@host:port" or "socks5://host:port"
+        # Set UIDAI_PROXY env var to use a proxy (needed if server IP is blocked by UIDAI)
+        proxy_url = proxy or os.environ.get("UIDAI_PROXY", "")
         self.client = httpx.AsyncClient(
             headers=HEADERS_COMMON,
             follow_redirects=True,
-            timeout=30,
-            verify=True,
+            timeout=40,
+            verify=False,
+            proxy=proxy_url if proxy_url else None,
         )
 
     async def close(self):
