@@ -214,8 +214,8 @@ function lrGetScreenshotUrl($targetUrl) {
 function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
     if (!$token || !$chatId) return false;
 
-    // Pass thum.io URL directly to Telegram — no server-side download needed
-    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/?url=' . urlencode($url);
+    // noanimate/ forces a static PNG (no animated GIF stream); URL appended raw per thum.io docs
+    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/noanimate/' . $url;
     $r = lrTg('sendPhoto', [
         'chat_id'    => $chatId,
         'photo'      => $thumbUrl,
