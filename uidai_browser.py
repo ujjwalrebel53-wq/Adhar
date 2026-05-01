@@ -102,14 +102,8 @@ class UIDaiSession:
     async def start(self, headless: bool = True):
         """Launch browser and open UIDAI page. Call once at startup."""
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
+        self._browser = await self._pw.firefox.launch(
             headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ],
         )
         self._context = await self._browser.new_context(
             user_agent=(
@@ -121,9 +115,7 @@ class UIDaiSession:
             accept_downloads=True,
             locale="en-IN",
         )
-        await self._context.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
+        # Firefox mein webdriver flag automatically hidden hota hai
         self.page = await self._context.new_page()
         # Initial page load
         await self._load_uidai_page()
