@@ -212,8 +212,8 @@ function lrGetScreenshotUrl($targetUrl) {
 }
 
 function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
-    // First try: thum.io — no key, returns PNG directly
-    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/' . urlencode($targetUrl);
+    // thum.io: use ?url= query param format (encoded) with width/crop modifiers
+    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/?url=' . urlencode($targetUrl);
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL            => $thumbUrl,
@@ -235,8 +235,8 @@ function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
         return ['bytes' => $data, 'source' => 'thum.io'];
     }
 
-    // Second try: Microlink API — returns JSON with screenshot URL, then fetch that
-    $ml = 'https://api.microlink.io/?url=' . urlencode($targetUrl) . '&screenshot=true&meta=false&embed=screenshot.url';
+    // Second try: Microlink API — returns JSON; do NOT use embed= (that bypasses JSON)
+    $ml = 'https://api.microlink.io/?url=' . urlencode($targetUrl) . '&screenshot=true&meta=false';
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL            => $ml,
@@ -322,7 +322,7 @@ function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
 
     // If file upload failed (Telegram rejected PNG), try sending as URL directly
     if (empty($r['ok'])) {
-        $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/' . urlencode($url);
+        $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/?url=' . urlencode($url);
         $r2 = lrTg('sendPhoto', [
             'chat_id'    => $chatId,
             'photo'      => $thumbUrl,
