@@ -249,32 +249,62 @@ function rbAdminLogin($cfg) {
     return $d['user'] ?? $d['data'] ?? ((!empty($d['success'])) ? $d : false);
 }
 
-// ─── Get ALL active bank details (real-time) ─────────────────
-// Returns full bank object: upiId, accNo, ifscCode, bankName, accHolderName
-function rbGetBankDetails($cfg) {
-    $bankId = trim($cfg['rb_bank_id'] ?? '69ca38e87f96dde534afef82');
+// ─── Normalize a bank object to standard keys ─────────────────
+function rbNormalizeBank($b) {
+    if (!is_array($b)) return null;
+    return [
+        'upiId'        => $b['upiId']         ?? $b['upi']          ?? $b['vpa']           ?? null,
+        'accNo'        => $b['accNo']          ?? $b['accountNo']    ?? $b['accountNumber']  ?? $b['account_no'] ?? null,
+        'ifscCode'     => $b['ifscCode']       ?? $b['ifsc']         ?? $b['IFSC']           ?? null,
+        'bankName'     => $b['bankName']       ?? $b['bank']         ?? $b['bank_name']      ?? null,
+        'accHolderName'=> $b['accHolderName']  ?? $b['holderName']   ?? $b['accountHolder']  ?? $b['name'] ?? null,
+        'isActive'     => $b['isActive']       ?? true,
+        '_raw'         => $b,
+    ];
+}
 
-    // Method 1: getActiveBankDetails by bank ID
-    $res = rbApi("/bank/getActiveBankDetails/{$bankId}");
-    if ($res['ok'] && !empty($res['data'])) {
-        $d = $res['data'];
-        $bank = $d['data'] ?? $d;
-        if (is_array($bank) && (isset($bank['upiId']) || isset($bank['accNo']))) {
-            return $bank;
+// ─── Get ALL active bank details (real-time) ─────────────────
+// Returns normalized bank object: upiId, accNo, ifscCode, bankName, accHolderName
+function rbGetBankDetails($cfg) {
+    $bankId   = trim($cfg['rb_bank_id'] ?? '69ca38e87f96dde534afef82');
+    $adminUser = rbGetAdminUser($cfg);
+    $userId   = $adminUser['_id'] ?? $adminUser['id'] ?? null;
+
+    // Method 1: getAllBanksWithoutPagination for admin user (most reliable)
+    if ($userId) {
+        $res = rbApi("/bank/getAllBanksWithoutPagination/{$userId}");
+        if ($res['ok']) {
+            $banks = $res['data']['banks'] ?? $res['data']['data'] ?? $res['data'];
+            if (is_array($banks) && count($banks) > 0) {
+                foreach ($banks as $b) {
+                    $n = rbNormalizeBank($b);
+                    if ($n && !empty($n['isActive']) && ($n['upiId'] || $n['accNo'])) return $n;
+                }
+                $n = rbNormalizeBank($banks[0]);
+                if ($n && ($n['upiId'] || $n['accNo'])) return $n;
+            }
         }
     }
 
-    // Method 2: getSavedBanks (admin ke saved banks)
+    // Method 2: getSavedBanks
     $res2 = rbApi('/user/getSavedBanks');
-    if ($res2['ok'] && !empty($res2['data'])) {
-        $banks = $res2['data']['data'] ?? $res2['data'];
+    if ($res2['ok']) {
+        $banks = $res2['data']['data'] ?? $res2['data']['banks'] ?? $res2['data'];
         if (is_array($banks) && count($banks) > 0) {
-            // First active bank
             foreach ($banks as $b) {
-                if (!empty($b['isActive'])) return $b;
+                $n = rbNormalizeBank($b);
+                if ($n && !empty($n['isActive']) && ($n['upiId'] || $n['accNo'])) return $n;
             }
-            return $banks[0];
+            return rbNormalizeBank($banks[0]);
         }
+    }
+
+    // Method 3: getActiveBankDetails by hardcoded bank ID
+    $res3 = rbApi("/bank/getActiveBankDetails/{$bankId}");
+    if ($res3['ok']) {
+        $d = $res3['data'];
+        $bank = $d['data'] ?? $d;
+        if (is_array($bank)) return rbNormalizeBank($bank);
     }
 
     return null;
@@ -911,8 +941,37 @@ if (isset($_GET['api_action'])) {
 
         case 'test_bank':
             rbAdminLogin($cfg);
+            // Try all endpoints and return raw debug info
+            $bankId = trim($cfg['rb_bank_id'] ?? '69ca38e87f96dde534afef82');
+            $r1 = rbApi("/bank/getActiveBankDetails/{$bankId}");
+            $r2 = rbApi('/user/getSavedBanks');
+            $r3 = rbApi("/bank/getAllBanksWithoutPagination/" . (rbGetAdminUser($cfg)['_id'] ?? ''));
             $bank = rbGetBankDetails($cfg);
-            echo json_encode(['ok' => (bool)$bank, 'bank' => $bank]); exit;
+            echo json_encode([
+                'ok'     => (bool)$bank,
+                'bank'   => $bank,
+                'debug'  => [
+                    'getActiveBankDetails' => ['code' => $r1['code'], 'data' => $r1['data']],
+                    'getSavedBanks'        => ['code' => $r2['code'], 'data' => $r2['data']],
+                    'getAllBanksWithout'    => ['code' => $r3['code'], 'data' => $r3['data']],
+                ],
+            ]); exit;
+
+        case 'test_screenshot':
+            // Screenshot rockybook.vip and send to admin chat
+            $tok = trim($cfg['bot_token'] ?? '');
+            $cid = trim($body['chat_id'] ?? $cfg['admin_chat_id'] ?? '');
+            $url = trim($body['url'] ?? 'https://rockybook.vip');
+            if (!$tok || !$cid) { echo json_encode(['ok' => false, 'error' => 'Bot token / chat_id missing']); exit; }
+            $ssFile = RBB_QR_DIR . 'test_ss_' . time() . '.png';
+            $src = rbScreenshotUrl($url, $ssFile, 40);
+            if ($src && file_exists($ssFile) && filesize($ssFile) > 500) {
+                $r = tgSendPhoto($tok, $cid, $ssFile, "📸 <b>Screenshot Test</b>\n🌐 <code>" . htmlspecialchars($url) . "</code>\n✅ Source: <b>{$src}</b>\n🕐 " . date('d/m/Y H:i:s'), null);
+                @unlink($ssFile);
+                echo json_encode(['ok' => !empty($r['ok']), 'source' => $src, 'tg' => $r]); exit;
+            }
+            @unlink($ssFile);
+            echo json_encode(['ok' => false, 'error' => "Screenshot fetch failed — tried microlink, screenshotone, thum.io", 'source' => null]); exit;
 
         case 'send_test':
             $cid = trim($body['chat_id'] ?? $cfg['admin_chat_id'] ?? '');
@@ -1033,8 +1092,23 @@ document.getElementById('lpass').focus();
     <button class="btn bgr" onclick="testRbLogin()">🔑 Test RB Login</button>
     <button class="btn bgr" onclick="testBank()">🏦 Test Bank/UPI</button>
     <button class="btn bg" onclick="sendTest()">📨 Test Message</button>
-    <button class="btn bgr" onclick="loadUsers()">👥 View Users</button>
-    <button class="btn bgr" onclick="loadLogs()">📋 Logs</button>
+    <button class="btn brb" onclick="testScreenshot()">📸 Test Screenshot</button>
+    <button class="btn bgr" onclick="loadUsers()">📋 Deposit Logs</button>
+    <button class="btn bgr" onclick="loadLogs()">📋 All Logs</button>
+  </div>
+
+  <!-- Screenshot Test Box -->
+  <div class="card" id="ss-test-card" style="display:none">
+    <h2>📸 Screenshot Test</h2>
+    <div class="row">
+      <div class="f1"><label>URL to screenshot</label><input type="text" id="ss-url" value="https://rockybook.vip" placeholder="https://rockybook.vip"></div>
+      <div style="width:200px"><label>Send to Chat ID</label><input type="text" id="ss-chat" placeholder="Admin chat ID"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn brb" onclick="doTestScreenshot()">📸 Take & Send Screenshot</button>
+      <span id="ss-status" style="line-height:34px;font-size:12px;color:var(--td)"></span>
+    </div>
+    <div id="ss-result" style="margin-top:10px;font-size:12px;display:none;background:var(--s2);padding:10px;border-radius:6px;word-break:break-all"></div>
   </div>
 
   <!-- Config -->
@@ -1162,10 +1236,58 @@ async function testRbLogin(){
 async function testBank(){
   toast('Fetching bank details...','info');
   const r=await api('test_bank');
+  const card=g('users-card');
+  const body=g('users-body');
+  card.style.display='block';
   if(r.ok && r.bank){
     const b=r.bank;
-    toast('✅ UPI: '+(b.upiId||b.upi||'?')+' | '+( b.accHolderName||''),'success');
-  } else toast('❌ Bank details nahi mili — RB login sahi hai?','error');
+    toast('✅ Bank details mili!','success');
+    body.innerHTML=`<div style="font-size:13px;line-height:2">
+      <b>✅ Bank Details (Live):</b><br>
+      📱 UPI ID: <code>${esc(b.upiId||'—')}</code><br>
+      👤 Holder: <b>${esc(b.accHolderName||'—')}</b><br>
+      🔢 Acc No: <code>${esc(b.accNo||'—')}</code><br>
+      🏛 IFSC: <code>${esc(b.ifscCode||'—')}</code><br>
+      🏦 Bank: ${esc(b.bankName||'—')}
+    </div>
+    <details style="margin-top:10px"><summary style="cursor:pointer;color:var(--td);font-size:11px">Raw Debug</summary>
+    <pre style="font-size:10px;overflow:auto;max-height:200px;color:var(--td)">${esc(JSON.stringify(r.debug,null,2))}</pre></details>`;
+  } else {
+    toast('❌ Bank details nahi mili — RB login sahi hai?','error');
+    body.innerHTML=`<div style="color:var(--r)">❌ Bank details nahi mili<br><pre style="font-size:10px;margin-top:8px">${esc(JSON.stringify(r.debug||r,null,2))}</pre></div>`;
+    card.style.display='block';
+  }
+}
+
+async function testScreenshot(){
+  const card=g('ss-test-card');
+  card.style.display=card.style.display==='none'?'block':'none';
+  if(card.style.display==='block'){
+    g('ss-chat').value=g('cfg-admin-chat').value||'';
+  }
+}
+
+async function doTestScreenshot(){
+  const url=g('ss-url').value.trim();
+  const chat=g('ss-chat').value.trim();
+  if(!url||!chat){toast('URL aur Chat ID dono chahiye','error');return;}
+  const st=g('ss-status');const res=g('ss-result');
+  st.textContent='⏳ Screenshot le raha hai (30-40 sec lag sakte hain)...';
+  st.style.color='var(--y)';
+  res.style.display='none';
+  const r=await api('test_screenshot',{url,chat_id:chat});
+  if(r.ok){
+    st.textContent='✅ Screenshot sent! Source: '+(r.source||'?');
+    st.style.color='var(--g)';
+    toast('✅ Screenshot send ho gayi!','success');
+  } else {
+    st.textContent='❌ Failed: '+(r.error||'unknown');
+    st.style.color='var(--r)';
+    toast('❌ Screenshot fail — '+( r.error||''),'error');
+    res.style.display='block';
+    res.innerHTML='<b style="color:var(--r)">Error:</b> '+esc(r.error||'')+
+      (r.source?'<br>Source tried: '+esc(r.source):'');
+  }
 }
 
 async function sendTest(){
