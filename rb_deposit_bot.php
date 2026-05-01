@@ -42,6 +42,12 @@ define('RB_API_BASE',     'https://rockybook.vip/api');
 define('TG_BASE',         'https://api.telegram.org/bot');
 define('MIN_DEPOSIT',     500);
 
+// ── HARDCODED DEPOSIT USER ───────────────────────────────────
+// Har deposit is user (@Ujjwal0999) ke account pe jayegi
+// RockyBook clientName: Ujjwal0999
+// _id will be auto-resolved on first login and cached
+define('RB_DEPOSIT_CLIENT', 'Ujjwal0999');
+
 if (!is_dir(RBB_COOKIE_DIR)) @mkdir(RBB_COOKIE_DIR, 0755, true);
 if (!is_dir(RBB_QR_DIR))     @mkdir(RBB_QR_DIR, 0755, true);
 
@@ -368,6 +374,40 @@ function rbGetAdminUser($cfg) {
     return $user;
 }
 
+// ─── Get hardcoded deposit user ID (@Ujjwal0999) ─────────────
+// Har deposit Ujjwal0999 ke account pe create hogi
+// ID auto-resolve hoti hai client name se, phir cache ho jaati hai
+function rbGetDepositUserId($cfg) {
+    $cacheFile = RBB_COOKIE_DIR . 'deposit_user.json';
+
+    // Check cache (24 hour valid)
+    if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < 86400) {
+        $cached = json_decode(file_get_contents($cacheFile), true);
+        if (!empty($cached['_id'])) return $cached;
+    }
+
+    // Find user by clientName from RockyBook
+    $clientName = RB_DEPOSIT_CLIENT;
+    $res = rbApi('/user/getUsers?page=1&limit=100000');
+    if ($res['ok']) {
+        $users = $res['data']['users'] ?? $res['data']['data'] ?? [];
+        if (is_array($users)) {
+            foreach ($users as $u) {
+                if (strtolower($u['clientName'] ?? '') === strtolower($clientName)) {
+                    $found = ['_id' => $u['_id'] ?? $u['id'], 'clientName' => $u['clientName']];
+                    file_put_contents($cacheFile, json_encode($found, JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    rbbLog("Deposit user resolved: {$clientName} → " . $found['_id'], 'info');
+                    return $found;
+                }
+            }
+        }
+    }
+
+    // Fallback: use admin user
+    rbbLog("Deposit user '{$clientName}' not found — using admin user as fallback", 'error');
+    return rbGetAdminUser($cfg);
+}
+
 // ─── Generate QR code (PHP GD — no library needed) ───────────
 function rbbGenerateQR($upiString, $outputFile) {
     // Use a free QR API (no library needed)
@@ -552,8 +592,12 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
         return false;
     }
 
-    $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
-    $branch   = trim($cfg['rb_branch'] ?? 'RBVIP1D');
+    // Always use hardcoded deposit user: @Ujjwal0999
+    $depositUser = rbGetDepositUserId($cfg);
+    $rbUserId    = $depositUser['_id'] ?? $depositUser['id'] ?? ($adminUser['_id'] ?? null);
+    $branch      = trim($cfg['rb_branch'] ?? 'RBVIP1D');
+
+    rbbLog("Creating deposit for user=" . RB_DEPOSIT_CLIENT . " id={$rbUserId} amount={$amount}", 'info');
 
     // Create transaction on site
     $txn   = rbCreateDeposit($cfg, $rbUserId, $amount);
@@ -1149,7 +1193,11 @@ document.getElementById('lpass').focus();
       </div>
       <div class="row">
         <div class="f1"><label>🌿 Branch Name</label><input type="text" id="cfg-branch" placeholder="RBVIP1D"></div>
-        <div class="f1"><label>🏦 Bank ID (UPI ke liye)</label><input type="text" id="cfg-bankid" placeholder="69ca38e87f96dde534afef82"></div>
+        <div class="f1"><label>🏦 Bank ID (for UPI details)</label><input type="text" id="cfg-bankid" placeholder="69ca38e87f96dde534afef82"></div>
+      </div>
+      <div style="background:rgba(57,255,20,.07);border:1px solid rgba(57,255,20,.25);border-radius:6px;padding:10px;font-size:12px;color:var(--g)">
+        🔒 <b>Hardcoded Deposit User:</b> <code>@Ujjwal0999</code> — All deposit transactions will be created on this account.
+      </div>
       </div>
     </div>
 
