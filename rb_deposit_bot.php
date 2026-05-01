@@ -271,59 +271,48 @@ function rbNormalizeBank($b) {
     return null;
 }
 
-// ─── Pick best bank from array ────────────────────────────────
-function rbPickBank($raw) {
-    if (empty($raw)) return null;
-    // Raw can be: array of banks, or wrapped in keys
-    $list = null;
-    if (isset($raw['banks']) && is_array($raw['banks']))      $list = $raw['banks'];
-    elseif (isset($raw['data']) && is_array($raw['data']))    $list = $raw['data'];
-    elseif (isset($raw[0]))                                    $list = $raw;      // direct array
-    elseif (isset($raw['upiId']) || isset($raw['accNo']))      $list = [$raw];    // single object
+// ─── Fetch bank details from PowerDreams payment page API ─────
+// Same API that powerdreams.co/online/pay page calls internally
+// Returns: bankDetails.upiId, accNo, ifscCode, bankName, accHolderName
+function rbGetBankDetails($cfg, $amount = 500) {
+    $branch = trim($cfg['rb_branch'] ?? 'RBVIP1D');
 
-    if (empty($list)) return null;
-    // Prefer active
-    foreach ($list as $b) {
-        if (!empty($b['isActive'])) { $n = rbNormalizeBank($b); if ($n) return $n; }
-    }
-    foreach ($list as $b) {
-        $n = rbNormalizeBank($b); if ($n) return $n;
-    }
-    return null;
-}
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => 'https://www.powerdreams.co/api/online/request/fetchAvailablePeer',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_HTTPHEADER     => [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'Origin: https://www.powerdreams.co',
+            'Referer: https://www.powerdreams.co/online/pay/' . $branch . '/test',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        ],
+        CURLOPT_POSTFIELDS     => json_encode([
+            'transactionType' => 'Deposit',
+            'branchUserName'  => $branch,
+            'amount'          => (int)$amount,
+        ]),
+    ]);
+    $raw  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
 
-// ─── Get deposit bank details (real-time from RockyBook) ──────
-function rbGetBankDetails($cfg) {
-    // Use the admin (logged-in) user's ID — same account as Ujjwal0999
-    $adminUser = rbGetAdminUser($cfg);
-    $uid = $adminUser['_id'] ?? $adminUser['id'] ?? null;
+    rbbLog("fetchAvailablePeer HTTP={$code} branch={$branch} amount={$amount} body=" . mb_substr($raw, 0, 500), 'info');
 
-    rbbLog("rbGetBankDetails — uid={$uid}", 'info');
-
-    // ── 1: getAllBanksWithoutPagination/{uid} ───────────────────
-    if ($uid) {
-        $r = rbApi("/bank/getAllBanksWithoutPagination/{$uid}");
-        rbbLog("getAllBanksWithoutPagination HTTP={$r['code']} body=" . mb_substr($r['raw'], 0, 400), 'info');
-        $b = rbPickBank($r['data']);
-        if ($b) { rbbLog("Bank found via getAllBanksWithoutPagination: upi={$b['upiId']} acc={$b['accNo']}", 'success'); return $b; }
-    }
-
-    // ── 2: getAllBanks_With_Pagination/{uid} ────────────────────
-    if ($uid) {
-        $r = rbApi("/bank/getAllBanks_With_Pagination/{$uid}?page=1&limit=20");
-        rbbLog("getAllBanks_With_Pagination HTTP={$r['code']} body=" . mb_substr($r['raw'], 0, 400), 'info');
-        $b = rbPickBank($r['data']);
-        if ($b) { rbbLog("Bank found via getAllBanks_With_Pagination: upi={$b['upiId']}", 'success'); return $b; }
+    $data = json_decode($raw, true);
+    if (empty($data['success']) || empty($data['bankDetails'])) {
+        rbbLog("fetchAvailablePeer failed: " . ($data['message'] ?? 'no bankDetails'), 'error');
+        return null;
     }
 
-    // ── 3: getSavedBanks ────────────────────────────────────────
-    $r = rbApi('/user/getSavedBanks');
-    rbbLog("getSavedBanks HTTP={$r['code']} body=" . mb_substr($r['raw'], 0, 400), 'info');
-    $b = rbPickBank($r['data']);
-    if ($b) { rbbLog("Bank found via getSavedBanks: upi={$b['upiId']}", 'success'); return $b; }
-
-    rbbLog("rbGetBankDetails: all 3 methods failed. uid={$uid}", 'error');
-    return null;
+    $bd = $data['bankDetails'];
+    return rbNormalizeBank($bd);
 }
 
 // ─── Create deposit transaction ───────────────────────────────
@@ -595,29 +584,16 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
         return false;
     }
 
-    // ── Get REAL bank details — always fetch fresh from API ──
-    $bank   = rbGetBankDetails($cfg);
+    // ── Get REAL bank details from PowerDreams payment page API ─
+    // Same call that powerdreams.co/online/pay/{branch}/{txnId} makes
+    $bank   = rbGetBankDetails($cfg, $amount);
     $upiId  = $bank['upiId']         ?? null;
     $accNo  = $bank['accNo']         ?? null;
     $ifsc   = $bank['ifscCode']      ?? null;
     $bankNm = $bank['bankName']      ?? null;
     $accName= $bank['accHolderName'] ?? null;
 
-    rbbLog("Bank details fetched — upi=" . ($upiId ?? 'NULL') . " acc=" . ($accNo ?? 'NULL') . " ifsc=" . ($ifsc ?? 'NULL') . " bank=" . ($bankNm ?? 'NULL') . " name=" . ($accName ?? 'NULL'), $bank ? 'success' : 'error');
-
-    // If STILL no bank details, try fetching from the transaction itself
-    if (!$upiId && !$accNo && $txnId) {
-        $txnRes = rbApi("/transaction/get_single_transactions/{$txnId}");
-        rbbLog("get_single_transactions HTTP={$txnRes['code']} data=" . mb_substr(json_encode($txnRes['data']), 0, 400), 'info');
-        if ($txnRes['ok'] && !empty($txnRes['data'])) {
-            $td    = $txnRes['data']['data'] ?? $txnRes['data'];
-            $upiId  = $td['upiId']         ?? $td['upi']          ?? $upiId;
-            $accNo  = $td['accNo']          ?? $td['accountNo']    ?? $accNo;
-            $ifsc   = $td['ifscCode']       ?? $td['ifsc']         ?? $ifsc;
-            $bankNm = $td['bankName']       ?? $bankNm;
-            $accName= $td['accHolderName']  ?? $td['holderName']   ?? $accName;
-        }
-    }
+    rbbLog("Bank details — upi=" . ($upiId ?? 'NULL') . " acc=" . ($accNo ?? 'NULL') . " ifsc=" . ($ifsc ?? 'NULL') . " bank=" . ($bankNm ?? 'NULL') . " name=" . ($accName ?? 'NULL'), $bank ? 'success' : 'error');
 
     // Real payment page URL (jo site pe redirect karti hai)
     $payPageUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
@@ -1020,22 +996,11 @@ if (isset($_GET['api_action'])) {
             echo json_encode($user ? ['ok' => true, 'user' => $user] : ['ok' => false, 'error' => 'Login failed']); exit;
 
         case 'test_bank':
-            rbAdminLogin($cfg);
-            $adminU = rbGetAdminUser($cfg);
-            $uid    = $adminU['_id'] ?? $adminU['id'] ?? '';
-            $r1 = rbApi("/bank/getAllBanksWithoutPagination/{$uid}");
-            $r2 = rbApi("/bank/getAllBanks_With_Pagination/{$uid}?page=1&limit=20");
-            $r3 = rbApi('/user/getSavedBanks');
-            $bank = rbGetBankDetails($cfg);
+            $bank = rbGetBankDetails($cfg, 500);
             echo json_encode([
-                'ok'       => (bool)$bank,
-                'bank'     => $bank,
-                'admin_id' => $uid,
-                'debug'    => [
-                    'getAllBanksWithoutPagination' => ['code'=>$r1['code'],'raw'=>mb_substr($r1['raw'],0,600)],
-                    'getAllBanks_With_Pagination'  => ['code'=>$r2['code'],'raw'=>mb_substr($r2['raw'],0,600)],
-                    'getSavedBanks'               => ['code'=>$r3['code'],'raw'=>mb_substr($r3['raw'],0,600)],
-                ],
+                'ok'     => (bool)$bank,
+                'bank'   => $bank,
+                'source' => 'powerdreams.co/api/online/request/fetchAvailablePeer',
             ]); exit;
 
         case 'test_screenshot':
@@ -1319,28 +1284,25 @@ async function testRbLogin(){
 }
 
 async function testBank(){
-  toast('Fetching bank details...','info');
+  toast('Fetching bank details from PowerDreams...','info');
   const r=await api('test_bank');
   const card=g('users-card');
   const body=g('users-body');
   card.style.display='block';
   if(r.ok && r.bank){
     const b=r.bank;
-    toast('✅ Bank details mili!','success');
-    body.innerHTML=`<div style="font-size:13px;line-height:2">
-      <b>✅ Bank Details (Live):</b><br>
+    toast('✅ Bank details found!','success');
+    body.innerHTML=`<div style="font-size:13px;line-height:2.2">
+      <b style="color:var(--g)">✅ Bank Details (powerdreams.co payment page):</b><br>
       📱 UPI ID: <code>${esc(b.upiId||'—')}</code><br>
       👤 Holder: <b>${esc(b.accHolderName||'—')}</b><br>
       🔢 Acc No: <code>${esc(b.accNo||'—')}</code><br>
       🏛 IFSC: <code>${esc(b.ifscCode||'—')}</code><br>
       🏦 Bank: ${esc(b.bankName||'—')}
-    </div>
-    <details style="margin-top:10px"><summary style="cursor:pointer;color:var(--td);font-size:11px">Raw Debug</summary>
-    <pre style="font-size:10px;overflow:auto;max-height:200px;color:var(--td)">${esc(JSON.stringify(r.debug,null,2))}</pre></details>`;
+    </div>`;
   } else {
-    toast('❌ No bank details found — RB login sahi hai?','error');
-    body.innerHTML=`<div style="color:var(--r)">❌ No bank details found<br><pre style="font-size:10px;margin-top:8px">${esc(JSON.stringify(r.debug||r,null,2))}</pre></div>`;
-    card.style.display='block';
+    toast('❌ Bank details not found','error');
+    body.innerHTML=`<div style="color:var(--r)">❌ fetchAvailablePeer failed<br><pre style="font-size:10px;margin-top:8px;color:var(--td)">${esc(JSON.stringify(r,null,2))}</pre></div>`;
   }
 }
 
