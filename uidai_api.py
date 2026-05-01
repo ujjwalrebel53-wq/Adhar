@@ -16,6 +16,7 @@ import re
 import tempfile
 import time
 import httpx
+from proxy_helper import get_working_indian_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +56,17 @@ class UIDaiSession:
         self._captcha_token: str = ""
 
     async def start(self, headless: bool = True, proxy: str = ""):
-        # proxy format: "http://user:pass@host:port" or "socks5://host:port"
-        # Set UIDAI_PROXY env var to use a proxy (needed if server IP is blocked by UIDAI)
+        # Use manual proxy > env var > auto-fetch Indian proxy
         proxy_url = proxy or os.environ.get("UIDAI_PROXY", "")
+        if not proxy_url:
+            logger.info("Koi proxy set nahi — Indian proxy auto-fetch ho rahi hai...")
+            found = await get_working_indian_proxy(max_test=50)
+            if found:
+                proxy_url = f"http://{found}"
+                logger.info(f"Auto proxy use ho raha hai: {proxy_url}")
+            else:
+                logger.warning("Koi proxy nahi mila — direct connect try karega.")
+        self._proxy_url = proxy_url
         self.client = httpx.AsyncClient(
             headers=HEADERS_COMMON,
             follow_redirects=True,
@@ -89,7 +98,27 @@ class UIDaiSession:
             r = await self.client.get(f"{BASE}/retrieve-eid-uid")
             r.raise_for_status()
         except Exception as e:
-            return {"ok": False, "error": f"UIDAI site nahi khuli: {e}"}
+            # Try rotating proxy once on failure
+            logger.warning(f"Connection fail ({e}) — naya proxy try kar raha hoon...")
+            found = await get_working_indian_proxy(max_test=60)
+            if found:
+                new_proxy = f"http://{found}"
+                logger.info(f"Naya proxy: {new_proxy}")
+                await self.client.aclose()
+                self.client = httpx.AsyncClient(
+                    headers=HEADERS_COMMON,
+                    follow_redirects=True,
+                    timeout=40,
+                    verify=False,
+                    proxy=new_proxy,
+                )
+                try:
+                    r = await self.client.get(f"{BASE}/retrieve-eid-uid")
+                    r.raise_for_status()
+                except Exception as e2:
+                    return {"ok": False, "error": f"Proxy se bhi UIDAI nahi khuli: {e2}"}
+            else:
+                return {"ok": False, "error": f"UIDAI site nahi khuli aur koi working proxy nahi mila. Server ka IP UIDAI ne block kar rakha hai."}
 
         # Extract XSRF / CSRF token from cookie or response body
         self._csrf = (
