@@ -214,15 +214,62 @@ function lrGetScreenshotUrl($targetUrl) {
 function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
     if (!$token || !$chatId) return false;
 
-    // allowJPG/noanimate/ forces static JPG output (no animated GIF); Telegram requires static image
+    // Download bytes from thum.io using a Telegram-bot-like user-agent
     $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/allowJPG/noanimate/' . $url;
-    $r = lrTg('sendPhoto', [
-        'chat_id'    => $chatId,
-        'photo'      => $thumbUrl,
-        'caption'    => $caption,
-        'parse_mode' => 'HTML',
-    ], $token);
-    lrLog('SS-DEBUG Telegram sendPhoto → ' . ($r['ok'] ? 'ok' : ('FAIL: ' . ($r['description'] ?? json_encode($r)))), $r['ok'] ? 'info' : 'error');
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $thumbUrl,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT      => 'TelegramBot (https://core.telegram.org/bots, 1.0)',
+    ]);
+    $bytes = curl_exec($ch);
+    $code  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $ct    = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    $err   = curl_error($ch);
+    curl_close($ch);
+    lrLog("SS-DEBUG thum.io → HTTP {$code}, CT: {$ct}, bytes: " . strlen((string)$bytes) . ($err ? ", err: {$err}" : ''), 'info');
+
+    if ($code !== 200 || !$bytes || !str_contains((string)$ct, 'image')) {
+        lrLog('SS-DEBUG thum.io fetch failed', 'error');
+        return false;
+    }
+
+    // Save to temp file and upload as multipart to Telegram
+    $ssFile = LR_SS_DIR . 'ss_' . md5($url . microtime()) . '.jpg';
+    file_put_contents($ssFile, $bytes);
+
+    if (!file_exists($ssFile) || filesize($ssFile) < 500) {
+        @unlink($ssFile);
+        lrLog('SS-DEBUG temp file too small or missing', 'error');
+        return false;
+    }
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => LR_TG_BASE . $token . '/sendPhoto',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_POSTFIELDS     => [
+            'chat_id'    => $chatId,
+            'caption'    => $caption,
+            'parse_mode' => 'HTML',
+            'photo'      => new CURLFile($ssFile, 'image/jpeg', 'screenshot.jpg'),
+        ],
+    ]);
+    $rawR = curl_exec($ch);
+    curl_close($ch);
+    @unlink($ssFile);
+
+    $r = json_decode($rawR, true);
+    lrLog('SS-DEBUG Telegram sendPhoto → ' . ($r['ok'] ? 'ok' : ('FAIL: ' . ($r['description'] ?? $rawR))), $r['ok'] ? 'info' : 'error');
     return !empty($r['ok']);
 }
 
