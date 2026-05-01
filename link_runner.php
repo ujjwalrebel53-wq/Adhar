@@ -33,11 +33,12 @@ if (!function_exists('str_contains')) {
 // ────────────────────────────────────────────────────────────
 
 define('LR_VERSION', '1.2');
-define('LR_CONFIG_FILE', __DIR__ . '/lr_config.json');
-define('LR_LOG_FILE',    __DIR__ . '/lr_logs.json');
-define('LR_TG_BASE',     'https://api.telegram.org/bot');
-define('LR_CURL_TO',     30);
-define('LR_SS_DIR',      __DIR__ . '/lr_screenshots/');
+define('LR_CONFIG_FILE',  __DIR__ . '/lr_config.json');
+define('LR_LOG_FILE',     __DIR__ . '/lr_logs.json');
+define('LR_SESSION_FILE', __DIR__ . '/lr_sessions.json');
+define('LR_TG_BASE',      'https://api.telegram.org/bot');
+define('LR_CURL_TO',      30);
+define('LR_SS_DIR',       __DIR__ . '/lr_screenshots/');
 
 // ─── Default config (loaded from lr_config.json if exists) ──
 $defaultConfig = [
@@ -192,6 +193,29 @@ function lrReplace($text, $vars) {
         $text = str_replace('{' . $k . '}', (string)$v, $text);
     }
     return $text;
+}
+
+// ─── Form-fill session helpers ──────────────────────────────────────
+function lrSessionLoad() {
+    if (!file_exists(LR_SESSION_FILE)) return [];
+    return json_decode(file_get_contents(LR_SESSION_FILE), true) ?: [];
+}
+function lrSessionSave($sessions) {
+    file_put_contents(LR_SESSION_FILE, json_encode($sessions, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+function lrSessionGet($chatId) {
+    $all = lrSessionLoad();
+    return $all[(string)$chatId] ?? null;
+}
+function lrSessionSet($chatId, $data) {
+    $all = lrSessionLoad();
+    $all[(string)$chatId] = $data;
+    lrSessionSave($all);
+}
+function lrSessionDel($chatId) {
+    $all = lrSessionLoad();
+    unset($all[(string)$chatId]);
+    lrSessionSave($all);
 }
 
 // ─── Screenshot via free external APIs (no browser install needed) ──
@@ -466,8 +490,136 @@ if (isset($_GET['webhook'])) {
     $msg  = $update['message'] ?? $update['channel_post'] ?? null;
     if (!$msg) { http_response_code(200); exit; }
     $text   = trim($msg['text'] ?? '');
-    $chatId = $msg['chat']['id'] ?? '';
+    $chatId = (string)($msg['chat']['id'] ?? '');
     $cmd    = trim($cfg['webhook_cmd'] ?? '/run');
+
+    // ── Check active form-fill session ───────────────────────
+    $session = lrSessionGet($chatId);
+    if ($session) {
+        // User cancelled
+        if (strtolower($text) === '/cancel') {
+            lrSessionDel($chatId);
+            lrTg('sendMessage', ['chat_id' => $chatId, 'text' => '❌ Form fill cancelled.', 'parse_mode' => 'HTML'], $wToken);
+            http_response_code(200); exit;
+        }
+
+        // Save answer for current field
+        $session['answers'][$session['fields'][$session['step']]] = $text;
+        $session['step']++;
+        lrSessionSet($chatId, $session);
+
+        // More fields to ask?
+        if ($session['step'] < count($session['fields'])) {
+            $nextField = $session['fields'][$session['step']];
+            lrTg('sendMessage', [
+                'chat_id'    => $chatId,
+                'text'       => "✏️ <b>" . htmlspecialchars($nextField, ENT_QUOTES) . "</b> dalo:\n<i>(ya /cancel likho)</i>",
+                'parse_mode' => 'HTML',
+            ], $wToken);
+            http_response_code(200); exit;
+        }
+
+        // All fields collected — find the link config
+        $formLink = null;
+        foreach ($cfg['links'] as $lk) {
+            if (($lk['id'] ?? '') === $session['link_id']) { $formLink = $lk; break; }
+        }
+
+        if (!$formLink) {
+            lrSessionDel($chatId);
+            lrTg('sendMessage', ['chat_id' => $chatId, 'text' => '⚠️ Link config nahi mila.'], $wToken);
+            http_response_code(200); exit;
+        }
+
+        // Build vars from answers + standard vars
+        $vars = array_merge([
+            'ts'   => date('Y-m-d H:i:s'),
+            'date' => date('Y-m-d'),
+            'time' => date('H:i:s'),
+        ], $session['answers']);
+
+        // Replace {field} placeholders in URL, body, headers
+        $fillUrl     = lrReplace(trim($formLink['url'] ?? ''),     $vars);
+        $fillHeaders = lrReplace(trim($formLink['headers'] ?? ''), $vars);
+        $fillBody    = lrReplace(trim($formLink['body'] ?? ''),    $vars);
+
+        // If body is empty and method is POST, build form body from answers
+        if (empty($fillBody) && strtoupper($formLink['method'] ?? 'GET') === 'POST') {
+            $fillBody = http_build_query($session['answers']);
+            if (empty($fillHeaders)) {
+                $fillHeaders = 'Content-Type: application/x-www-form-urlencoded';
+            }
+        }
+
+        $timeout = max(5, min(120, (int)($formLink['timeout'] ?? 30)));
+        $ssl     = !isset($formLink['ssl_verify']) || (bool)$formLink['ssl_verify'];
+        $result  = lrFetch($fillUrl, strtoupper($formLink['method'] ?? 'POST'), $fillHeaders, $fillBody, $timeout, $ssl);
+
+        lrSessionDel($chatId);
+
+        $success = $result['code'] >= 200 && $result['code'] < 400;
+        $summary = $success
+            ? "✅ <b>Form submit ho gaya!</b>\nHTTP: <code>{$result['code']}</code>"
+            : "⚠️ <b>Submit fail hua.</b>\nHTTP: <code>{$result['code']}</code>\n<pre>" . htmlspecialchars(mb_substr($result['body'] ?? '', 0, 300)) . "</pre>";
+
+        lrTg('sendMessage', [
+            'chat_id'    => $chatId,
+            'text'       => $summary,
+            'parse_mode' => 'HTML',
+        ], $wToken);
+
+        lrLog("Form fill [{$session['link_id']}] → HTTP {$result['code']}", $success ? 'success' : 'error');
+        http_response_code(200); exit;
+    }
+
+    // ── /fill <link_name_or_id> command ──────────────────────
+    if (str_starts_with(strtolower($text), '/fill')) {
+        $parts   = explode(' ', $text, 2);
+        $search  = strtolower(trim($parts[1] ?? ''));
+        $found   = null;
+        foreach ($cfg['links'] as $lk) {
+            if (!empty($lk['form_fill_mode']) && (
+                strtolower($lk['name'] ?? '') === $search ||
+                strtolower($lk['id']   ?? '') === $search ||
+                $search === ''
+            )) { $found = $lk; break; }
+        }
+        if (!$found) {
+            // List available form-fill links
+            $list = array_filter($cfg['links'], fn($l) => !empty($l['form_fill_mode']));
+            if (empty($list)) {
+                lrTg('sendMessage', ['chat_id' => $chatId, 'text' => '⚠️ Koi form-fill link configure nahi hai.', 'parse_mode' => 'HTML'], $wToken);
+            } else {
+                $names = implode("\n", array_map(fn($l) => "• <code>" . htmlspecialchars($l['name']) . "</code>", $list));
+                lrTg('sendMessage', ['chat_id' => $chatId, 'text' => "📋 Available forms:\n$names\n\n/fill &lt;name&gt; likho", 'parse_mode' => 'HTML'], $wToken);
+            }
+            http_response_code(200); exit;
+        }
+
+        // Parse fields
+        $fields = array_values(array_filter(array_map('trim', explode(',', $found['form_fields'] ?? '')), fn($f) => $f !== ''));
+        if (empty($fields)) {
+            lrTg('sendMessage', ['chat_id' => $chatId, 'text' => '⚠️ Is link ke liye form fields configure nahi hain.', 'parse_mode' => 'HTML'], $wToken);
+            http_response_code(200); exit;
+        }
+
+        // Start session
+        lrSessionSet($chatId, [
+            'link_id' => $found['id'],
+            'fields'  => $fields,
+            'step'    => 0,
+            'answers' => [],
+        ]);
+
+        lrTg('sendMessage', [
+            'chat_id'    => $chatId,
+            'text'       => "📝 <b>" . htmlspecialchars($found['name']) . "</b> form shuru ho raha hai.\n\n✏️ <b>" . htmlspecialchars($fields[0]) . "</b> dalo:\n<i>(ya /cancel likho)</i>",
+            'parse_mode' => 'HTML',
+        ], $wToken);
+        http_response_code(200); exit;
+    }
+
+    // ── Normal /run command ───────────────────────────────────
     if (str_starts_with(strtolower($text), strtolower($cmd))) {
         lrTg('sendMessage', ['chat_id' => $chatId, 'text' => '⏳ Running links...', 'parse_mode' => 'HTML'], $wToken);
         $results = lrRunAll($cfg, ['tg_chat' => $chatId]);
@@ -576,6 +728,9 @@ if (isset($_GET['api_action'])) {
                     'chat_id'            => trim($lk['chat_id'] ?? ''),
                     'screenshot_mode'    => (bool)($lk['screenshot_mode'] ?? false),
                     'screenshot_caption' => trim($lk['screenshot_caption'] ?? "📸 <b>{name}</b>\n🌐 <code>{url}</code>\n🕐 {ts}"),
+                    'form_fill_mode'     => (bool)($lk['form_fill_mode'] ?? false),
+                    'form_fields'        => trim($lk['form_fields'] ?? ''),
+                    'form_submit_field'  => trim($lk['form_submit_field'] ?? ''),
                 ];
             }
             $cfg['links'] = $links;
@@ -950,6 +1105,25 @@ function buildLinkEl(lk,i){
       Bas URL dalo, screenshot automatically bot pe aa jayega.
     </div>
   </div>
+
+  <div style="margin-top:10px">
+    <label class="switch"><input type="checkbox" id="lffm_${lk.id}" ${lk.form_fill_mode?'checked':''} onchange="syncField('${lk.id}','form_fill_mode',this.checked);toggleFormFill('${lk.id}',this.checked)"> 📋 Form Fill Mode</label>
+  </div>
+  <div id="lff_wrap_${lk.id}" style="${lk.form_fill_mode?'':'display:none'}">
+    <div class="row" style="margin-top:8px">
+      <div class="f1">
+        <label>📋 Form Fields (comma separated)</label>
+        <input type="text" id="lff_${lk.id}" value="${esc(lk.form_fields||'')}" placeholder="username, password, email" onchange="syncField('${lk.id}','form_fields',this.value)">
+        <small style="color:var(--tf)">Bot user se ek ek karke ye fields puchega. URL/Body mein {username} jaise use karo.</small>
+      </div>
+    </div>
+    <div style="background:rgba(99,179,237,.06);border:1px solid rgba(99,179,237,.2);border-radius:6px;padding:8px 12px;margin-top:4px;font-size:11px;color:var(--tf)">
+      📌 Bot pe <b>/fill ${esc(lk.name||'link name')}</b> command bhejo → bot har field puchega → reply karo → form submit ho jayega.<br>
+      URL example: <code>https://site.com/login?user={username}&pass={password}</code><br>
+      Body example: <code>username={username}&password={password}</code>
+    </div>
+  </div>
+
   <div class="result-box" id="lr_${lk.id}"></div>
 </div>`;
   return div;
@@ -963,6 +1137,10 @@ function toggleCard(id){
 }
 function toggleSsCaption(id,show){
   const w=g('lss_wrap_'+id);
+  if(w) w.style.display=show?'':'none';
+}
+function toggleFormFill(id,show){
+  const w=g('lff_wrap_'+id);
   if(w) w.style.display=show?'':'none';
 }
 function deleteLink(id){
