@@ -55,6 +55,11 @@ define('RBB_RATE_FILE',       __DIR__ . '/rbb_ratelimit.json');
 define('RBB_BLOCK_MINUTES',   30);   // block duration in minutes
 define('RBB_MAX_INCOMPLETE',  2);    // kitni baar incomplete deposit allow hai
 
+// ── LEDGER (user balances) ────────────────────────────────────
+// Local ledger — admin approves deposits, balance credited here
+define('RBB_LEDGER_FILE',     __DIR__ . '/rbb_ledger.json');
+define('WITHDRAWAL_CONTACT',  '@Rebel_babyyy'); // Withdrawal support contact
+
 if (!is_dir(RBB_COOKIE_DIR)) @mkdir(RBB_COOKIE_DIR, 0755, true);
 if (!is_dir(RBB_QR_DIR))     @mkdir(RBB_QR_DIR, 0755, true);
 
@@ -69,7 +74,7 @@ $defaultConfig = [
     'rb_bank_id'     => '', // Optional: specific bank ID (leave blank = auto-detect)
     'min_deposit'    => 500,
     'max_deposit'    => 100000,
-    'welcome_msg'    => "🎯 <b>Rebel B2W</b>\n\nWelcome! Use this bot to make deposits quickly and easily.\n\n/Deposit — Start a deposit\n/Balance — Check balance\n/Help — Help",
+    'welcome_msg'    => "🎯 <b>Rebel B2W</b>\n\nWelcome! Use this bot to manage your deposits and withdrawals.\n\n💰 /Deposit — Make a deposit\n💸 /Withdrawal — Request a withdrawal\n💳 /Balance — Check your balance\n❓ /Help — Help",
     'deposit_thanks' => "✅ <b>Transaction Submitted!</b>\n\nAdmin will verify shortly. Contact support if you need help.",
 ];
 
@@ -167,6 +172,55 @@ function rlRemainingTime($blockedUntil) {
     $secs = max(0, $blockedUntil - time());
     $mins = ceil($secs / 60);
     return $mins . ' minute' . ($mins == 1 ? '' : 's');
+}
+
+// ─── User Ledger ─────────────────────────────────────────────
+// Tracks approved deposits and withdrawals per Telegram chat ID
+function ldLoad() {
+    if (!file_exists(RBB_LEDGER_FILE)) return [];
+    return json_decode(file_get_contents(RBB_LEDGER_FILE), true) ?: [];
+}
+function ldSave($data) {
+    file_put_contents(RBB_LEDGER_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+function ldGetUser($chatId) {
+    $ld = ldLoad();
+    return $ld[(string)$chatId] ?? [
+        'chat_id'    => $chatId,
+        'balance'    => 0,
+        'deposits'   => [],
+        'withdrawals'=> [],
+    ];
+}
+
+// Add approved deposit (called by admin)
+function ldAddDeposit($chatId, $amount, $utr, $txnId = null) {
+    $ld  = ldLoad();
+    $key = (string)$chatId;
+    if (!isset($ld[$key])) $ld[$key] = ['chat_id' => $chatId, 'balance' => 0, 'deposits' => [], 'withdrawals' => []];
+    $ld[$key]['balance']    += (float)$amount;
+    $ld[$key]['deposits'][]  = [
+        'amount' => (float)$amount,
+        'utr'    => $utr,
+        'txn_id' => $txnId,
+        'time'   => date('c'),
+        'status' => 'approved',
+    ];
+    ldSave($ld);
+}
+
+// Add withdrawal (pending)
+function ldAddWithdrawal($chatId, $amount) {
+    $ld  = ldLoad();
+    $key = (string)$chatId;
+    if (!isset($ld[$key])) $ld[$key] = ['chat_id' => $chatId, 'balance' => 0, 'deposits' => [], 'withdrawals' => []];
+    $ld[$key]['withdrawals'][] = [
+        'amount' => (float)$amount,
+        'time'   => date('c'),
+        'status' => 'pending',
+    ];
+    ldSave($ld);
 }
 
 // ─── Logging ─────────────────────────────────────────────────
@@ -979,6 +1033,45 @@ function processUtrSubmission($token, $chatId, $utr, $state, $cfg) {
     rbbLog("UTR noted — chat={$chatId} utr={$utr} waiting for screenshot", 'info');
 }
 
+// ─── Handle withdrawal QR code upload ────────────────────────
+function handleWithdrawalQr($token, $chatId, $msg, $state, $cfg) {
+    $data    = $state['data'] ?? [];
+    $wAmount = (float)($data['w_amount'] ?? 0);
+    $bal     = (float)($data['balance'] ?? 0);
+
+    // Forward QR to admin
+    $adminChatId = trim($cfg['admin_chat_id'] ?? '');
+    $contact     = WITHDRAWAL_CONTACT;
+
+    if ($adminChatId) {
+        tg('forwardMessage', [
+            'chat_id'      => $adminChatId,
+            'from_chat_id' => $chatId,
+            'message_id'   => $msg['message_id'],
+        ], $token);
+        tgSend($token, $adminChatId,
+            "💸 <b>Withdrawal Request</b>\n\n"
+          . "📊 TG: <code>{$chatId}</code>\n"
+          . "💰 Amount: ₹" . number_format($wAmount, 2) . "\n"
+          . "💳 Available Balance: ₹" . number_format($bal, 2) . "\n"
+          . "🕐 " . date('d/m/Y H:i:s')
+        );
+    }
+
+    // Record withdrawal
+    ldAddWithdrawal($chatId, $wAmount);
+    rbbClearState($chatId);
+
+    // Confirm to user
+    tgSend($token, $chatId,
+        "✅ <b>Withdrawal Request Accepted</b>\n\n"
+      . "💰 Amount: <b>₹" . number_format($wAmount, 2) . "</b>\n\n"
+      . "Your request has been received. Please contact {$contact} for further assistance."
+    );
+
+    rbbLog("Withdrawal QR submitted — chat={$chatId} amount={$wAmount}", 'success');
+}
+
 // ─── Main webhook handler ─────────────────────────────────────
 function handleUpdate($update, $cfg) {
     $token = trim($cfg['bot_token'] ?? '');
@@ -1027,12 +1120,20 @@ function handleUpdate($update, $cfg) {
 
     if (!$chatId) return;
 
-    // Handle screenshot submission
+    // Handle image/photo uploads
     $state = rbbGetState($chatId);
     if ($state && ($photo || $doc)) {
         $st = $state['state'] ?? '';
+
+        // Deposit screenshot verification
         if (in_array($st, ['awaiting_utr', 'awaiting_utr_text', 'awaiting_screenshot'])) {
             handleScreenshotUtr($token, $chatId, $msg, $state, $cfg);
+            return;
+        }
+
+        // Withdrawal QR code upload
+        if ($st === 'awaiting_withdrawal_qr') {
+            handleWithdrawalQr($token, $chatId, $msg, $state, $cfg);
             return;
         }
     }
@@ -1044,7 +1145,8 @@ function handleUpdate($update, $cfg) {
         $welcome = str_replace('\n', "\n", $cfg['welcome_msg'] ?? "Welcome to Rebel B2W!");
         tgSend($token, $chatId, $welcome, [
             'keyboard' => [
-                [['text' => '💰 Deposit'], ['text' => '❓ Help']],
+                [['text' => '💰 Deposit'], ['text' => '💸 Withdraw']],
+                [['text' => '💳 Balance'],  ['text' => '❓ Help']],
             ],
             'resize_keyboard'   => true,
             'one_time_keyboard' => false,
@@ -1059,22 +1161,44 @@ function handleUpdate($update, $cfg) {
         return;
     }
 
-    if ($cmd === '/balance') {
-        $adminUser = rbGetAdminUser($cfg);
-        if (!$adminUser) {
-        tgSend($token, $chatId, "❌ Server error. Please contact admin.");
+    if ($cmd === '/balance' || $text === '💳 Balance') {
+        $user = ldGetUser($chatId);
+        $bal  = (float)($user['balance'] ?? 0);
+
+        // Recent approved deposits
+        $deps = array_slice(array_reverse($user['deposits'] ?? []), 0, 5);
+        $depLines = '';
+        foreach ($deps as $d) {
+            $t = date('d/m/Y', strtotime($d['time']));
+            $depLines .= "\n✅ ₹" . number_format($d['amount']) . " — {$t}" . ($d['utr'] ? " (UTR: {$d['utr']})" : '');
+        }
+
+        tgSend($token, $chatId,
+            "💳 <b>Your Rebel B2W Balance</b>\n\n"
+          . "💰 Available Balance: <b>₹" . number_format($bal, 2) . "</b>\n\n"
+          . ($depLines ? "<b>Recent Deposits:</b>" . $depLines : "<i>No approved deposits yet.</i>")
+          . "\n\n<i>Balance is credited after admin approves your payment.</i>"
+        );
         return;
     }
-    $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
-    if ($rbUserId) {
-        $res = rbApi("/transaction/get_MainUserBalance/{$rbUserId}");
-        if ($res['ok']) {
-            $bal = $res['data']['balance'] ?? $res['data']['currentBalance'] ?? $res['data']['data'] ?? '—';
-            tgSend($token, $chatId, "💳 <b>Rebel B2W Balance</b>\n\n₹" . (is_numeric($bal) ? number_format((float)$bal, 2) : $bal));
-        } else {
-            tgSend($token, $chatId, "❌ Could not fetch balance. Please try again later.");
+
+    if ($cmd === '/withdrawal' || $text === '💸 Withdraw') {
+        $user = ldGetUser($chatId);
+        $bal  = (float)($user['balance'] ?? 0);
+        if ($bal <= 0) {
+            tgSend($token, $chatId,
+                "❌ <b>Insufficient Balance</b>\n\n"
+              . "Your current balance is <b>₹0</b>.\n"
+              . "Make a deposit first to request withdrawal."
+            );
+            return;
         }
-    }
+        tgSend($token, $chatId,
+            "💸 <b>Withdrawal Request</b>\n\n"
+          . "💰 Your Balance: <b>₹" . number_format($bal, 2) . "</b>\n\n"
+          . "Enter the amount you want to withdraw:"
+        );
+        rbbSetState($chatId, 'awaiting_withdrawal_amount', ['balance' => $bal]);
         return;
     }
 
@@ -1082,9 +1206,10 @@ function handleUpdate($update, $cfg) {
         tgSend($token, $chatId,
             "❓ <b>Help</b>\n\n"
           . "/Deposit — Make a deposit\n"
+          . "/Withdrawal — Request a withdrawal\n"
           . "/Balance — Check your balance\n"
           . "/Start — Restart bot\n\n"
-          . "Contact admin for support."
+          . "For support contact " . WITHDRAWAL_CONTACT
         );
         return;
     }
@@ -1119,6 +1244,38 @@ function handleUpdate($update, $cfg) {
         case 'awaiting_screenshot':
             // User sent text instead of screenshot
             tgSend($token, $chatId, "📸 Please send a <b>screenshot</b> of your payment (not text).");
+            break;
+
+        case 'awaiting_withdrawal_amount':
+            $wAmount = (float)preg_replace('/[^0-9.]/', '', $text);
+            $bal     = (float)($state['data']['balance'] ?? 0);
+            if ($wAmount <= 0) {
+                tgSend($token, $chatId, "❌ Please enter a valid amount.\n\nExample: <code>500</code>");
+                return;
+            }
+            if ($wAmount > $bal) {
+                tgSend($token, $chatId,
+                    "❌ Insufficient balance.\n\n"
+                  . "Available: <b>₹" . number_format($bal, 2) . "</b>\n"
+                  . "Requested: <b>₹" . number_format($wAmount, 2) . "</b>"
+                );
+                return;
+            }
+            // Ask for QR code
+            tgSend($token, $chatId,
+                "📸 <b>Send your UPI QR Code</b>\n\n"
+              . "Amount: <b>₹" . number_format($wAmount, 2) . "</b>\n\n"
+              . "Send a screenshot of your UPI QR code so we can process your withdrawal."
+            );
+            rbbSetState($chatId, 'awaiting_withdrawal_qr', [
+                'balance'  => $bal,
+                'w_amount' => $wAmount,
+            ]);
+            break;
+
+        case 'awaiting_withdrawal_qr':
+            // Text instead of QR image
+            tgSend($token, $chatId, "📸 Please send your <b>UPI QR code image</b> (not text).");
             break;
 
         default:
@@ -1238,6 +1395,33 @@ if (isset($_GET['api_action'])) {
             if (!$cid || !$tok) { echo json_encode(['ok' => false, 'error' => 'Bot token / chat_id missing']); exit; }
             $r = tgSend($tok, $cid, "✅ <b>Rebel B2W</b> is working!\n\n" . date('d/m/Y H:i:s'));
             echo json_encode(['ok' => $r['ok'] ?? false]); exit;
+
+        case 'approve_deposit':
+            // Admin approves a deposit — credits user balance
+            $chatIdApprove = trim($body['chat_id'] ?? '');
+            $approveAmount = (float)($body['amount'] ?? 0);
+            $approveUtr    = trim($body['utr'] ?? '');
+            $approveTxn    = trim($body['txn_id'] ?? '');
+            if (!$chatIdApprove || $approveAmount <= 0) {
+                echo json_encode(['ok' => false, 'error' => 'chat_id and amount required']); exit;
+            }
+            ldAddDeposit($chatIdApprove, $approveAmount, $approveUtr, $approveTxn);
+            // Notify user
+            $tok = trim($cfg['bot_token'] ?? '');
+            if ($tok) {
+                tgSend($tok, $chatIdApprove,
+                    "✅ <b>Deposit Approved!</b>\n\n"
+                  . "💰 ₹" . number_format($approveAmount, 2) . " has been credited to your account.\n"
+                  . ($approveUtr ? "🔢 UTR: <code>{$approveUtr}</code>\n" : '')
+                  . "\nUse /Balance to check your balance."
+                );
+            }
+            rbbLog("Deposit approved — chat={$chatIdApprove} amount={$approveAmount} utr={$approveUtr}", 'success');
+            echo json_encode(['ok' => true, 'user' => ldGetUser($chatIdApprove)]); exit;
+
+        case 'get_ledger':
+            $ld = ldLoad();
+            echo json_encode(['ok' => true, 'ledger' => $ld, 'total_users' => count($ld)]); exit;
 
         case 'get_blocked_users':
             $rl = rlLoad();
