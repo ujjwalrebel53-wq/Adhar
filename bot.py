@@ -112,8 +112,8 @@ async def fetch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     session = _browser_session
-    if not session or not session.page:
-        await update.message.reply_text("⚠️ Browser session ready nahi hai. Thodi der mein try karo.")
+    if not session:
+        await update.message.reply_text("⚠️ Session ready nahi hai. Thodi der mein try karo.")
         return ConversationHandler.END
 
     status_msg = await update.message.reply_text(LOADING_STEPS[0], parse_mode=ParseMode.HTML)
@@ -286,10 +286,10 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Startup / Shutdown hooks ───────────────────────────────────────────
 async def on_startup(app: Application) -> None:
     global _browser_session
-    logger.info("Browser session start ho raha hai...")
+    logger.info("UIDAI HTTP session start ho rahi hai...")
     _browser_session = UIDaiSession()
-    await _browser_session.start(headless=True)
-    logger.info("Browser session ready — UIDAI page loaded.")
+    await _browser_session.start()
+    logger.info("UIDAI session ready.")
 
 
 async def on_shutdown(app: Application) -> None:
