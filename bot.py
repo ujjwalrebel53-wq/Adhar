@@ -302,12 +302,11 @@ async def on_shutdown(app: Application) -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────
 def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable set nahi hai!")
+    token = BOT_TOKEN or "8750675658:AAGj9h3DvN8KzSHviWh6g3hiaCkycrk1aoI"
 
     app = (
         Application.builder()
-        .token(BOT_TOKEN)
+        .token(token)
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
