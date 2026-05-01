@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8750675658:AAGj9h3DvN8KzSHviWh6g3hiaCkycrk1aoI")
 
 # Conversation states
 CAPTCHA_INPUT, OTP_INPUT = range(2)
