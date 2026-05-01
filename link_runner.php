@@ -42,14 +42,28 @@ define('LR_SS_DIR',       __DIR__ . '/lr_screenshots/');
 
 // ─── Default config (loaded from lr_config.json if exists) ──
 $defaultConfig = [
-    'admin_pass'   => 'rebel@2026',   // Change after first login!
-    'run_secret'   => 'changeme123',  // Secret for ?run=1&secret=X
-    'bot_token'    => '',             // Telegram bot token
-    'chat_id'      => '',             // Default chat/channel to send to
-    'send_prefix'  => '🔗 <b>Link Runner</b>\n\n', // Prefix for messages
-    'links'        => [],             // Array of link rules (see addLink())
-    'webhook_token'=> '',             // Bot token for webhook mode
-    'webhook_cmd'  => '/run',         // Command that triggers a run
+    'admin_pass'   => 'rebel@2026',
+    'run_secret'   => 'changeme123',
+    'bot_token'    => '',
+    'chat_id'      => '',
+    'send_prefix'  => '🔗 <b>Link Runner</b>\n\n',
+    'links'        => [],
+    'webhook_token'=> '',
+    'webhook_cmd'  => '/run',
+    // ── Python bot config (editable from UI) ──
+    'py_bot_token'     => '',
+    'py_uidai_proxy'   => '',
+    'py_fetch_cmd'     => '/fetch',
+    'py_cancel_cmd'    => '/cancel',
+    'py_refresh_cmd'   => '/refresh',
+    'py_start_msg'     => "👾 <b>Aadhaar Retrieve Bot</b> — Online ✅\n\n📌 <b>Command:</b>\n<code>/fetch &lt;mobile&gt; &lt;fullname&gt;</code>\n\nExample:\n<code>/fetch 9876543210 Ravi Kumar</code>",
+    'py_loading_steps' => "🔐 Secure tunnel initialize ho raha hai...\n🛰️ UIDAI node se connect ho raha hai...\n🧬 Session payload inject ho raha hai...\n🔍 Biometric endpoint resolve ho raha hai...\n⚡ Sandbox bypass ho raha hai...\n🗝️ Identity matrix decrypt ho rahi hai...\n📋 Form fill ho raha hai...\n📸 Captcha capture ho raha hai...",
+    'py_otp_steps'     => "🔐 OTP token validate ho raha hai...\n🧬 Biometric hash cross-reference ho raha hai...\n📂 Encrypted Aadhaar file locate ho rahi hai...\n⬇️ Document decrypt aur package ho raha hai...\n✅ Document secured. Bhej raha hoon...",
+    'py_captcha_msg'   => "📸 <b>Captcha ready hai!</b>\n\nNeeche captcha image dekho aur <b>text reply karo.</b>\n<i>/refresh = naya captcha | /cancel = band karo</i>",
+    'py_otp_msg'       => "📲 <b>OTP bheja gaya!</b>\n📱 <code>{mobile}</code> pe OTP aaya hoga.\n\n🔢 <b>OTP reply karo:</b>\n<i>/cancel = band karo</i>",
+    'py_success_msg'   => "✅ <b>Aadhaar document ready!</b>\n🔒 <i>Yeh file sirf aapke liye hai. Safely store karo.</i>",
+    'py_cancel_msg'    => "❌ <b>Process cancel kar diya.</b>\nDobara shuru karne ke liye /fetch karo.",
+    'py_error_prefix'  => "❌ <b>Error:</b>",
 ];
 
 if (!is_dir(LR_SS_DIR)) @mkdir(LR_SS_DIR, 0755, true);
@@ -896,6 +910,29 @@ if (isset($_GET['api_action'])) {
             $r = lrTg('deleteWebhook', [], $wToken);
             echo json_encode(['ok' => $r['ok'] ?? false]); exit;
 
+        case 'get_py_config':
+            $pyKeys = ['py_bot_token','py_uidai_proxy','py_fetch_cmd','py_cancel_cmd','py_refresh_cmd',
+                       'py_start_msg','py_loading_steps','py_otp_steps','py_captcha_msg','py_otp_msg',
+                       'py_success_msg','py_cancel_msg','py_error_prefix'];
+            $out = [];
+            foreach ($pyKeys as $k) $out[$k] = $cfg[$k] ?? $defaultConfig[$k] ?? '';
+            echo json_encode(['ok' => true, 'data' => $out]); exit;
+
+        case 'save_py_config':
+            $pyKeys = ['py_bot_token','py_uidai_proxy','py_fetch_cmd','py_cancel_cmd','py_refresh_cmd',
+                       'py_start_msg','py_loading_steps','py_otp_steps','py_captcha_msg','py_otp_msg',
+                       'py_success_msg','py_cancel_msg','py_error_prefix'];
+            foreach ($pyKeys as $k) {
+                if (isset($body[$k])) $cfg[$k] = $body[$k];
+            }
+            lrSaveConfig($cfg);
+            // Write bot_config.json for Python bot to read
+            $pyOut = [];
+            foreach ($pyKeys as $k) $pyOut[$k] = $cfg[$k] ?? '';
+            file_put_contents(__DIR__ . '/bot_config.json', json_encode($pyOut, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            lrLog('Python bot config saved', 'info');
+            echo json_encode(['ok' => true]); exit;
+
         default:
             echo json_encode(['ok' => false, 'error' => 'Unknown action']); exit;
     }
@@ -1024,6 +1061,53 @@ document.getElementById('lpass').focus();
       <button class="btn bgr bsm" onclick="setWebhook()">🔗 Set Webhook</button>
       <button class="btn bgr bsm" onclick="removeWebhook()">❌ Remove Webhook</button>
       <button class="btn bc" onclick="saveConfig()">💾 Save Config</button>
+    </div>
+  </div>
+
+  <!-- Python Bot Config Card -->
+  <div class="card" id="pybot-card">
+    <h2 style="cursor:pointer" onclick="togglePyCard()">🐍 Python Aadhaar Bot Config <span id="pybot-arrow">▼</span></h2>
+    <div id="pybot-body">
+      <div class="row">
+        <div class="f1"><label>🤖 Bot Token (Python bot ka alag token)</label><input type="password" id="py-token" placeholder="123456:ABC..."></div>
+        <div class="f1"><label>🌐 UIDAI Proxy (optional, socks5://host:port)</label><input type="text" id="py-proxy" placeholder="socks5://127.0.0.1:1080"></div>
+      </div>
+      <div class="row">
+        <div class="f1"><label>📟 Fetch Command</label><input type="text" id="py-fetch-cmd" placeholder="/fetch"></div>
+        <div class="f1"><label>❌ Cancel Command</label><input type="text" id="py-cancel-cmd" placeholder="/cancel"></div>
+        <div class="f1"><label>🔄 Refresh Command</label><input type="text" id="py-refresh-cmd" placeholder="/refresh"></div>
+      </div>
+      <div class="row">
+        <div class="f1">
+          <label>👋 Start Message</label>
+          <textarea id="py-start-msg" rows="4"></textarea>
+        </div>
+      </div>
+      <div class="row">
+        <div class="f1">
+          <label>⏳ Loading Steps (ek line = ek step)</label>
+          <textarea id="py-loading-steps" rows="8"></textarea>
+        </div>
+        <div class="f1">
+          <label>🔐 OTP Loading Steps (ek line = ek step)</label>
+          <textarea id="py-otp-steps" rows="8"></textarea>
+        </div>
+      </div>
+      <div class="row">
+        <div class="f1"><label>📸 Captcha Message</label><textarea id="py-captcha-msg" rows="3"></textarea></div>
+        <div class="f1"><label>📲 OTP Message ({mobile} placeholder)</label><textarea id="py-otp-msg" rows="3"></textarea></div>
+      </div>
+      <div class="row">
+        <div class="f1"><label>✅ Success Message (PDF sent)</label><textarea id="py-success-msg" rows="2"></textarea></div>
+        <div class="f1"><label>❌ Cancel Message</label><textarea id="py-cancel-msg" rows="2"></textarea></div>
+        <div class="f1"><label>⚠️ Error Prefix</label><input type="text" id="py-error-prefix" placeholder="❌ &lt;b&gt;Error:&lt;/b&gt;"></div>
+      </div>
+      <div style="background:rgba(99,179,237,.06);border:1px solid rgba(99,179,237,.2);border-radius:6px;padding:8px 12px;margin:8px 0;font-size:11px;color:var(--tf)">
+        💾 Save hone pe <b>bot_config.json</b> file banti hai — Python bot ussi se settings load karta hai. Bot restart ki zaroorat nahi.
+      </div>
+      <div class="flex-end">
+        <button class="btn bc" onclick="savePyConfig()">💾 Save Bot Config</button>
+      </div>
     </div>
   </div>
 
@@ -1270,6 +1354,53 @@ async function savePage(){
   await saveLinks();
 }
 
+/* ─── Python Bot Config ──────────────────────────────── */
+function togglePyCard(){
+  const b=g('pybot-body'), a=g('pybot-arrow');
+  const hidden=b.style.display==='none';
+  b.style.display=hidden?'':'none';
+  a.textContent=hidden?'▼':'▶';
+}
+
+async function loadPyConfig(){
+  const r=await api('get_py_config');
+  if(!r.ok) return;
+  const d=r.data;
+  g('py-token').value         = d.py_bot_token||'';
+  g('py-proxy').value         = d.py_uidai_proxy||'';
+  g('py-fetch-cmd').value     = d.py_fetch_cmd||'/fetch';
+  g('py-cancel-cmd').value    = d.py_cancel_cmd||'/cancel';
+  g('py-refresh-cmd').value   = d.py_refresh_cmd||'/refresh';
+  g('py-start-msg').value     = d.py_start_msg||'';
+  g('py-loading-steps').value = d.py_loading_steps||'';
+  g('py-otp-steps').value     = d.py_otp_steps||'';
+  g('py-captcha-msg').value   = d.py_captcha_msg||'';
+  g('py-otp-msg').value       = d.py_otp_msg||'';
+  g('py-success-msg').value   = d.py_success_msg||'';
+  g('py-cancel-msg').value    = d.py_cancel_msg||'';
+  g('py-error-prefix').value  = d.py_error_prefix||'';
+}
+
+async function savePyConfig(){
+  const payload={
+    py_bot_token:    g('py-token').value.trim(),
+    py_uidai_proxy:  g('py-proxy').value.trim(),
+    py_fetch_cmd:    g('py-fetch-cmd').value.trim(),
+    py_cancel_cmd:   g('py-cancel-cmd').value.trim(),
+    py_refresh_cmd:  g('py-refresh-cmd').value.trim(),
+    py_start_msg:    g('py-start-msg').value,
+    py_loading_steps:g('py-loading-steps').value,
+    py_otp_steps:    g('py-otp-steps').value,
+    py_captcha_msg:  g('py-captcha-msg').value,
+    py_otp_msg:      g('py-otp-msg').value,
+    py_success_msg:  g('py-success-msg').value,
+    py_cancel_msg:   g('py-cancel-msg').value,
+    py_error_prefix: g('py-error-prefix').value.trim(),
+  };
+  const r=await api('save_py_config', payload);
+  r.ok ? toast('✅ Python bot config saved! bot_config.json update hua.','success') : toast('Error: '+(r.error||''),'error');
+}
+
 /* ─── Run All ────────────────────────────────────────── */
 async function runAll(){
   g('run-status').textContent='⏳ Running...';
@@ -1338,6 +1469,7 @@ async function clearLogs(){
 /* ─── Init ───────────────────────────────────────────── */
 loadConfig();
 loadLogs();
+loadPyConfig();
 </script>
 </body>
 </html>
