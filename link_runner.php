@@ -212,7 +212,6 @@ function lrGetScreenshotUrl($targetUrl) {
 }
 
 function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
-    // thum.io: use ?url= query param format (encoded) with width/crop modifiers
     $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/?url=' . urlencode($targetUrl);
     $ch = curl_init();
     curl_setopt_array($ch, [
@@ -235,45 +234,7 @@ function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
         return ['bytes' => $data, 'source' => 'thum.io'];
     }
 
-    // Second try: Microlink API — returns JSON; do NOT use embed= (that bypasses JSON)
-    $ml = 'https://api.microlink.io/?url=' . urlencode($targetUrl) . '&screenshot=true&meta=false';
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => $ml,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => $timeout,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS      => 5,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
-    ]);
-    $raw = curl_exec($ch);
-    $mlErr = curl_error($ch);
-    curl_close($ch);
-    $mlData = json_decode($raw, true);
-    $ssUrl = $mlData['data']['screenshot']['url'] ?? ($mlData['data']['screenshot'] ?? null);
-    lrLog("SS-DEBUG microlink → ssUrl: " . ($ssUrl ?: 'none') . ($mlErr ? ", err: {$mlErr}" : ''), 'info');
-    if ($ssUrl && str_starts_with($ssUrl, 'http')) {
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL            => $ssUrl,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 20,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_FOLLOWLOCATION => true,
-        ]);
-        $imgData = curl_exec($ch);
-        $imgCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $imgErr  = curl_error($ch);
-        curl_close($ch);
-        lrLog("SS-DEBUG microlink img fetch → HTTP {$imgCode}, bytes: " . strlen((string)$imgData) . ($imgErr ? ", err: {$imgErr}" : ''), 'info');
-        if ($imgCode === 200 && $imgData) {
-            return ['bytes' => $imgData, 'source' => 'microlink'];
-        }
-    }
-
-    lrLog('SS-DEBUG all APIs failed, returning null', 'error');
+    lrLog('SS-DEBUG thum.io failed, returning null', 'error');
     return null;
 }
 
@@ -965,7 +926,7 @@ function buildLinkEl(lk,i){
       </div>
     </div>
     <div style="background:rgba(57,255,20,.06);border:1px solid rgba(57,255,20,.2);border-radius:6px;padding:8px 12px;margin-top:4px;font-size:11px;color:var(--g)">
-      ✅ <b>Koi browser install nahi chahiye!</b> Free screenshot APIs use hoti hain (thum.io → microlink).<br>
+      ✅ <b>Koi browser install nahi chahiye!</b> thum.io screenshot API use hoti hai.<br>
       Bas URL dalo, screenshot automatically bot pe aa jayega.
     </div>
   </div>
