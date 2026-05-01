@@ -211,89 +211,18 @@ function lrGetScreenshotUrl($targetUrl) {
     ];
 }
 
-function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
-    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/?url=' . urlencode($targetUrl);
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => $thumbUrl,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => $timeout,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS      => 5,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
-    ]);
-    $data = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $ct   = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-    $err  = curl_error($ch);
-    curl_close($ch);
-    lrLog("SS-DEBUG thum.io → HTTP {$code}, CT: {$ct}, bytes: " . strlen((string)$data) . ($err ? ", err: {$err}" : ''), 'info');
-    if ($code === 200 && $data && str_contains((string)$ct, 'image')) {
-        return ['bytes' => $data, 'source' => 'thum.io'];
-    }
-
-    lrLog('SS-DEBUG thum.io failed, returning null', 'error');
-    return null;
-}
-
 function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
-    if (!$token || !$chatId) {
-        lrLog('SS-DEBUG lrTakeScreenshot: missing token or chatId', 'error');
-        return false;
-    }
+    if (!$token || !$chatId) return false;
 
-    $result = lrFetchScreenshotBytes($url, $timeout);
-    if (!$result) {
-        lrLog('SS-DEBUG lrTakeScreenshot: lrFetchScreenshotBytes returned null', 'error');
-        return false;
-    }
-
-    $ssFile = LR_SS_DIR . 'ss_' . md5($url . microtime()) . '.png';
-    file_put_contents($ssFile, $result['bytes']);
-
-    if (!file_exists($ssFile) || filesize($ssFile) < 500) {
-        lrLog('SS-DEBUG lrTakeScreenshot: saved file missing or too small (' . (file_exists($ssFile) ? filesize($ssFile) : 0) . ' bytes)', 'error');
-        @unlink($ssFile);
-        return false;
-    }
-
-    // Send as photo via multipart
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => LR_TG_BASE . $token . '/sendPhoto',
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST           => true,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_TIMEOUT        => 40,
-        CURLOPT_POSTFIELDS     => [
-            'chat_id'    => $chatId,
-            'caption'    => $caption . "\n<i>via " . ($result['source'] ?? 'API') . "</i>",
-            'parse_mode' => 'HTML',
-            'photo'      => new CURLFile($ssFile, 'image/png', 'screenshot.png'),
-        ],
-    ]);
-    $rawR = curl_exec($ch);
-    curl_close($ch);
-    @unlink($ssFile);
-    $r = json_decode($rawR, true);
-    lrLog('SS-DEBUG Telegram sendPhoto (file) → ' . ($r['ok'] ? 'ok' : ('FAIL: ' . ($r['description'] ?? $rawR))), $r['ok'] ? 'info' : 'error');
-
-    // If file upload failed (Telegram rejected PNG), try sending as URL directly
-    if (empty($r['ok'])) {
-        $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/?url=' . urlencode($url);
-        $r2 = lrTg('sendPhoto', [
-            'chat_id'    => $chatId,
-            'photo'      => $thumbUrl,
-            'caption'    => $caption,
-            'parse_mode' => 'HTML',
-        ], $token);
-        lrLog('SS-DEBUG Telegram sendPhoto (URL fallback) → ' . ($r2['ok'] ? 'ok' : ('FAIL: ' . ($r2['description'] ?? json_encode($r2)))), $r2['ok'] ? 'info' : 'error');
-        return !empty($r2['ok']);
-    }
-
+    // Pass thum.io URL directly to Telegram — no server-side download needed
+    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/?url=' . urlencode($url);
+    $r = lrTg('sendPhoto', [
+        'chat_id'    => $chatId,
+        'photo'      => $thumbUrl,
+        'caption'    => $caption,
+        'parse_mode' => 'HTML',
+    ], $token);
+    lrLog('SS-DEBUG Telegram sendPhoto → ' . ($r['ok'] ? 'ok' : ('FAIL: ' . ($r['description'] ?? json_encode($r)))), $r['ok'] ? 'info' : 'error');
     return !empty($r['ok']);
 }
 
