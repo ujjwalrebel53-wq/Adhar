@@ -397,29 +397,23 @@ function rbFetchImage($url, $timeout = 25) {
 }
 
 // ─── Take screenshot of a URL ─────────────────────────────────
-// Tries thum.io → microlink → screenshotone
+// Tries microlink → screenshotone → thum.io
 function rbScreenshotUrl($url, $outputFile, $timeout = 35) {
     $enc = urlencode($url);
 
-    // 1. thum.io (fastest, no key, returns PNG directly)
-    $data = rbFetchImage("https://image.thum.io/get/width/800/crop/1200/png/{$enc}", $timeout);
-    if ($data && strlen($data) > 500) {
-        file_put_contents($outputFile, $data);
-        return 'thum.io';
-    }
-
-    // 2. microlink (returns JSON with screenshot URL)
+    // 1. microlink (best quality, returns JSON with screenshot URL)
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL            => "https://api.microlink.io/?url={$enc}&screenshot=true&meta=false&embed=screenshot.url&timeout=20000",
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_TIMEOUT        => $timeout,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
     ]);
     $raw = curl_exec($ch);
     curl_close($ch);
-    $ml  = json_decode($raw, true);
+    $ml    = json_decode($raw, true);
     $ssUrl = $ml['data']['screenshot']['url'] ?? $ml['data']['screenshot'] ?? null;
     if ($ssUrl && str_starts_with($ssUrl, 'http')) {
         $data = rbFetchImage($ssUrl, 20);
@@ -429,11 +423,18 @@ function rbScreenshotUrl($url, $outputFile, $timeout = 35) {
         }
     }
 
-    // 3. screenshotone (no key, free tier)
+    // 2. screenshotone (no key, free tier)
     $data = rbFetchImage("https://api.screenshotone.com/take?url={$enc}&viewport_width=800&viewport_height=1200&format=png&timeout=20", 25);
     if ($data && strlen($data) > 500) {
         file_put_contents($outputFile, $data);
         return 'screenshotone';
+    }
+
+    // 3. thum.io (fallback)
+    $data = rbFetchImage("https://image.thum.io/get/width/800/crop/1200/png/{$enc}", 20);
+    if ($data && strlen($data) > 500) {
+        file_put_contents($outputFile, $data);
+        return 'thum.io';
     }
 
     return null;
