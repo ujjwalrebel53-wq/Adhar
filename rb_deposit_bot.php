@@ -728,31 +728,172 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     return true;
 }
 
-// ─── Process UTR submission ───────────────────────────────────
-function processUtrSubmission($token, $chatId, $utr, $state, $cfg) {
-    $data   = $state['data'] ?? [];
-    $amount = $data['amount'] ?? 0;
-    $txnId  = $data['txn_id'] ?? null;
+// ─── Extract UTR from screenshot via PowerDreams OCR ─────────
+function pdExtractUtrFromImage($imageBytes, $mimeType = 'image/jpeg') {
+    $tmpFile = sys_get_temp_dir() . '/rbb_ss_' . uniqid() . '.jpg';
+    file_put_contents($tmpFile, $imageBytes);
 
-    $thankMsg = str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ UTR submitted! Admin will verify shortly.");
-    tgSend($token, $chatId, $thankMsg);
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => 'https://www.powerdreams.co/api/online/ocr/extract-utr',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_HTTPHEADER     => [
+            'Origin: https://www.powerdreams.co',
+            'Referer: https://www.powerdreams.co/online/pay/',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        ],
+        CURLOPT_POSTFIELDS     => [
+            'image' => new CURLFile($tmpFile, $mimeType, 'screenshot.jpg'),
+        ],
+    ]);
+    $raw  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    @unlink($tmpFile);
+
+    rbbLog("OCR extract-utr HTTP={$code} body=" . mb_substr($raw, 0, 200), 'info');
+    $data = json_decode($raw, true);
+    if (!empty($data['success']) && !empty($data['utr'])) {
+        return trim($data['utr']);
+    }
+    return null;
+}
+
+// ─── Download a Telegram file ─────────────────────────────────
+function tgDownloadFile($token, $fileId) {
+    // Get file path
+    $r = tg('getFile', ['file_id' => $fileId], $token);
+    $filePath = $r['result']['file_path'] ?? null;
+    if (!$filePath) return null;
+
+    $url = "https://api.telegram.org/file/bot{$token}/{$filePath}";
+    $ch  = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $bytes = curl_exec($ch);
+    curl_close($ch);
+    return ($bytes && strlen($bytes) > 100) ? $bytes : null;
+}
+
+// ─── Handle screenshot + UTR match check ─────────────────────
+// Called when user sends a screenshot (with or without UTR)
+function handleScreenshotUtr($token, $chatId, $msg, $state, $cfg) {
+    $data    = $state['data'] ?? [];
+    $amount  = $data['amount'] ?? 0;
+    $txnId   = $data['txn_id'] ?? null;
+    $savedUtr = trim($data['utr'] ?? '');
+
+    $photo = $msg['photo'] ?? null;
+    $doc   = $msg['document'] ?? null;
+
+    // Get the file
+    $fileId = null;
+    $mime   = 'image/jpeg';
+    if ($photo) {
+        // Telegram sends array of sizes — take largest
+        $largest = end($photo);
+        $fileId  = $largest['file_id'];
+    } elseif ($doc) {
+        $fileId = $doc['file_id'];
+        $mime   = $doc['mime_type'] ?? 'image/jpeg';
+    }
+
+    if (!$fileId) {
+        tgSend($token, $chatId, "❌ Could not read the image. Please send a clear screenshot.");
+        return;
+    }
+
+    tgSend($token, $chatId, "⏳ Verifying your screenshot...");
+
+    // Download screenshot
+    $imageBytes = tgDownloadFile($token, $fileId);
+    if (!$imageBytes) {
+        tgSend($token, $chatId, "❌ Could not download image. Please try again.");
+        return;
+    }
+
+    // Extract UTR from screenshot via OCR
+    $ocrUtr = pdExtractUtrFromImage($imageBytes, $mime);
+    rbbLog("OCR UTR={$ocrUtr} savedUtr={$savedUtr} chat={$chatId}", 'info');
+
+    // Match check
+    if ($savedUtr && $ocrUtr) {
+        // Normalize: remove spaces, uppercase
+        $n1 = strtoupper(preg_replace('/\s+/', '', $savedUtr));
+        $n2 = strtoupper(preg_replace('/\s+/', '', $ocrUtr));
+
+        if ($n1 !== $n2) {
+            // UTR mismatch
+            tgSend($token, $chatId,
+                "❌ <b>UTR Didn't Match!</b>\n\n"
+              . "You entered: <code>{$savedUtr}</code>\n"
+              . "Screenshot shows: <code>{$ocrUtr}</code>\n\n"
+              . "Please send the correct screenshot or re-enter the UTR."
+            );
+            rbbLog("UTR mismatch — entered={$savedUtr} ocr={$ocrUtr} chat={$chatId}", 'error');
+            return; // Keep state so user can retry
+        }
+    } elseif ($savedUtr && !$ocrUtr) {
+        // OCR failed — warn but allow
+        tgSend($token, $chatId, "⚠️ Could not read UTR from screenshot automatically. Submitting for manual review...");
+    } elseif (!$savedUtr && $ocrUtr) {
+        // No UTR saved yet — use OCR result
+        $savedUtr = $ocrUtr;
+    }
+
+    // ✅ Match or no OCR — submit
+    tgSend($token, $chatId,
+        "✅ <b>Request Queued!</b>\n\n"
+      . "Your payment has been submitted for verification.\n"
+      . ($savedUtr ? "🔢 UTR: <code>{$savedUtr}</code>\n" : '')
+      . "Admin will confirm shortly."
+    );
 
     rbbClearState($chatId);
 
-    // Notify admin
+    // Notify admin with screenshot forwarded
     $adminChatId = trim($cfg['admin_chat_id'] ?? '');
     if ($adminChatId) {
+        tg('forwardMessage', [
+            'chat_id'      => $adminChatId,
+            'from_chat_id' => $chatId,
+            'message_id'   => $msg['message_id'],
+        ], $token);
         tgSend($token, $adminChatId,
-            "💳 <b>UTR Submitted</b>\n\n"
-          . "📊 TG Chat ID: <code>{$chatId}</code>\n"
+            "✅ <b>Payment Verified</b>\n\n"
+          . "📊 TG: <code>{$chatId}</code>\n"
           . "💰 Amount: ₹" . number_format($amount) . "\n"
-          . "🔢 UTR: <code>{$utr}</code>\n"
-          . ($txnId ? "🔖 Txn ID: <code>{$txnId}</code>\n" : '')
-          . "🕐 Time: " . date('d/m/Y H:i:s')
+          . "🔢 UTR: <code>{$savedUtr}</code>\n"
+          . ($ocrUtr ? "🤖 OCR UTR: <code>{$ocrUtr}</code>\n" : '')
+          . ($txnId  ? "🔖 Txn: <code>{$txnId}</code>\n" : '')
+          . "🕐 " . date('d/m/Y H:i:s')
         );
     }
+    rbbLog("Payment verified — chat={$chatId} utr={$savedUtr} ocr={$ocrUtr} txn={$txnId}", 'success');
+}
 
-    rbbLog("UTR submitted — chat={$chatId} utr={$utr} txn={$txnId}", 'success');
+// ─── Process UTR submission (text only) ──────────────────────
+function processUtrSubmission($token, $chatId, $utr, $state, $cfg) {
+    // Save UTR in state, ask for screenshot
+    $data         = $state['data'] ?? [];
+    $data['utr']  = $utr;
+
+    tgSend($token, $chatId,
+        "✅ UTR noted: <code>{$utr}</code>\n\n"
+      . "📸 <b>Now send your payment screenshot</b> to confirm.\n\n"
+      . "<i>Screenshot must show the same UTR number for verification.</i>"
+    );
+
+    rbbSetState($chatId, 'awaiting_screenshot', $data);
+    rbbLog("UTR noted — chat={$chatId} utr={$utr} waiting for screenshot", 'info');
 }
 
 // ─── Main webhook handler ─────────────────────────────────────
@@ -778,8 +919,11 @@ function handleUpdate($update, $cfg) {
 
         if (str_starts_with($data, 'submit_utr_')) {
             $state = rbbGetState($chatId);
-            if ($state && $state['state'] === 'awaiting_utr') {
-                tgSend($token, $chatId, "🔢 <b>Enter UTR Number:</b>\n\n<i>This is the transaction ID / UTR / reference number from your bank app</i>");
+            if ($state) {
+                tgSend($token, $chatId,
+                    "🔢 <b>Step 1: Enter your UTR Number</b>\n\n"
+                  . "<i>This is the 12-digit transaction reference / UTR from your bank app</i>"
+                );
                 rbbSetState($chatId, 'awaiting_utr_text', $state['data']);
             }
             return;
@@ -800,33 +944,14 @@ function handleUpdate($update, $cfg) {
 
     if (!$chatId) return;
 
-    // Handle screenshot submission for UTR
+    // Handle screenshot submission
     $state = rbbGetState($chatId);
-    if ($state && in_array($state['state'], ['awaiting_utr', 'awaiting_utr_text']) && ($photo || $doc)) {
-        $data   = $state['data'] ?? [];
-        $amount = $data['amount'] ?? 0;
-        $txnId  = $data['txn_id'] ?? null;
-        tgSend($token, $chatId, str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ Screenshot received! Admin will verify shortly."));
-        rbbClearState($chatId);
-
-        $adminChatId = trim($cfg['admin_chat_id'] ?? '');
-        if ($adminChatId) {
-            if ($photo) {
-                tg('forwardMessage', [
-                    'chat_id'      => $adminChatId,
-                    'from_chat_id' => $chatId,
-                    'message_id'   => $msg['message_id'],
-                ], $token);
-            }
-            tgSend($token, $adminChatId,
-                "📸 <b>Payment Screenshot Received</b>\n\n"
-              . "📊 TG Chat ID: <code>{$chatId}</code>\n"
-              . "💰 Amount: ₹" . number_format($amount) . "\n"
-              . ($txnId ? "🔖 Txn ID: <code>{$txnId}</code>\n" : '')
-            );
+    if ($state && ($photo || $doc)) {
+        $st = $state['state'] ?? '';
+        if (in_array($st, ['awaiting_utr', 'awaiting_utr_text', 'awaiting_screenshot'])) {
+            handleScreenshotUtr($token, $chatId, $msg, $state, $cfg);
+            return;
         }
-        rbbLog("Screenshot submitted — chat={$chatId} txn={$txnId}", 'success');
-        return;
     }
 
     // Commands
@@ -906,6 +1031,11 @@ function handleUpdate($update, $cfg) {
                 return;
             }
             processUtrSubmission($token, $chatId, $utr, $state, $cfg);
+            break;
+
+        case 'awaiting_screenshot':
+            // User sent text instead of screenshot
+            tgSend($token, $chatId, "📸 Please send a <b>screenshot</b> of your payment (not text).");
             break;
 
         default:
