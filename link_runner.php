@@ -233,28 +233,7 @@ function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
         return ['bytes' => $data, 'source' => 'thum.io'];
     }
 
-    // Second try: screenshotmachine.com free (no key for basic)
-    $sm = 'https://api.screenshotmachine.com/?url=' . urlencode($targetUrl) . '&dimension=1280x900&format=png&cacheLimit=0';
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => $sm,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => $timeout,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS      => 5,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
-    ]);
-    $data = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $ct   = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-    curl_close($ch);
-    if ($code === 200 && $data && str_contains((string)$ct, 'image')) {
-        return ['bytes' => $data, 'source' => 'screenshotmachine'];
-    }
-
-    // Third try: Microlink API — returns JSON with screenshot URL, then fetch that
+    // Second try: Microlink API — returns JSON with screenshot URL, then fetch that
     $ml = 'https://api.microlink.io/?url=' . urlencode($targetUrl) . '&screenshot=true&meta=false&embed=screenshot.url';
     $ch = curl_init();
     curl_setopt_array($ch, [
@@ -970,7 +949,7 @@ function buildLinkEl(lk,i){
       </div>
     </div>
     <div style="background:rgba(57,255,20,.06);border:1px solid rgba(57,255,20,.2);border-radius:6px;padding:8px 12px;margin-top:4px;font-size:11px;color:var(--g)">
-      ✅ <b>Koi browser install nahi chahiye!</b> Free screenshot APIs use hoti hain (thum.io → screenshotmachine → microlink).<br>
+      ✅ <b>Koi browser install nahi chahiye!</b> Free screenshot APIs use hoti hain (thum.io → microlink).<br>
       Bas URL dalo, screenshot automatically bot pe aa jayega.
     </div>
   </div>
