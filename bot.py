@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from uidai_browser import UIDaiSession
+from uidai_api import UIDaiSession
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
