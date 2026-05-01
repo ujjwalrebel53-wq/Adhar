@@ -236,34 +236,13 @@ function lrGetScreenshotUrl($targetUrl) {
 }
 
 function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
-    // 1. thum.io
+    // 1. Microlink — headless browser, JS sites ke liye wait karta hai
+    $mlTimeout = min($timeout, 45);
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL            => 'https://image.thum.io/get/width/1280/crop/900/allowJPG/noanimate/' . $targetUrl,
+        CURLOPT_URL            => 'https://api.microlink.io/?url=' . urlencode($targetUrl) . '&screenshot=true&meta=false&waitUntil=networkidle2',
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => $timeout,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS      => 5,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
-    ]);
-    $bytes = curl_exec($ch);
-    $code  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $ct    = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-    $err   = curl_error($ch);
-    curl_close($ch);
-    lrLog("SS-DEBUG thum.io → HTTP {$code}, CT: {$ct}, bytes: " . strlen((string)$bytes) . ($err ? ", err: {$err}" : ''), 'info');
-    if ($code === 200 && $bytes && str_contains((string)$ct, 'image')) {
-        return ['bytes' => $bytes, 'ext' => 'jpg'];
-    }
-
-    // 2. Microlink
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => 'https://api.microlink.io/?url=' . urlencode($targetUrl) . '&screenshot=true&meta=false',
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_TIMEOUT        => $mlTimeout,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS      => 5,
@@ -294,6 +273,28 @@ function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
         if ($imgCode === 200 && $imgBytes) {
             return ['bytes' => $imgBytes, 'ext' => 'png'];
         }
+    }
+
+    // 2. thum.io — fallback (static sites ke liye theek hai)
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => 'https://image.thum.io/get/width/1280/crop/900/allowJPG/noanimate/' . $targetUrl,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
+    ]);
+    $bytes = curl_exec($ch);
+    $code  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $ct    = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    $err   = curl_error($ch);
+    curl_close($ch);
+    lrLog("SS-DEBUG thum.io → HTTP {$code}, CT: {$ct}, bytes: " . strlen((string)$bytes) . ($err ? ", err: {$err}" : ''), 'info');
+    if ($code === 200 && $bytes && str_contains((string)$ct, 'image')) {
+        return ['bytes' => $bytes, 'ext' => 'jpg'];
     }
 
     lrLog('SS-DEBUG all APIs failed', 'error');
