@@ -624,7 +624,21 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     $bankNm = $bank['bankName']      ?? null;
     $accName= $bank['accHolderName'] ?? null;
 
-    rbbLog("Bank details fetched — upi={$upiId} acc={$accNo} ifsc={$ifsc} bank={$bankNm} name={$accName}", 'info');
+    rbbLog("Bank details fetched — upi=" . ($upiId ?? 'NULL') . " acc=" . ($accNo ?? 'NULL') . " ifsc=" . ($ifsc ?? 'NULL') . " bank=" . ($bankNm ?? 'NULL') . " name=" . ($accName ?? 'NULL'), $bank ? 'success' : 'error');
+
+    // If STILL no bank details, try fetching from the transaction itself
+    if (!$upiId && !$accNo && $txnId) {
+        $txnRes = rbApi("/transaction/get_single_transactions/{$txnId}");
+        rbbLog("get_single_transactions HTTP={$txnRes['code']} data=" . mb_substr(json_encode($txnRes['data']), 0, 400), 'info');
+        if ($txnRes['ok'] && !empty($txnRes['data'])) {
+            $td    = $txnRes['data']['data'] ?? $txnRes['data'];
+            $upiId  = $td['upiId']         ?? $td['upi']          ?? $upiId;
+            $accNo  = $td['accNo']          ?? $td['accountNo']    ?? $accNo;
+            $ifsc   = $td['ifscCode']       ?? $td['ifsc']         ?? $ifsc;
+            $bankNm = $td['bankName']       ?? $bankNm;
+            $accName= $td['accHolderName']  ?? $td['holderName']   ?? $accName;
+        }
+    }
 
     // Real payment page URL (jo site pe redirect karti hai)
     $payPageUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
@@ -637,16 +651,27 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     ];
 
     // ── Full bank details message (always send this) ──────────
+    // Always show the payment page link as fallback
+    $payPageUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
+
     $bankMsg = "🎯 <b>Rebel B2W Deposit Details</b>\n\n"
              . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
-             . "🔖 Txn ID: <code>{$txnId}</code>\n"
-             . "\n<b>💳 Bank / UPI Details:</b>\n"
-             . ($upiId   ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
-             . ($accName ? "👤 Name: <b>{$accName}</b>\n" : '')
-             . ($accNo   ? "🔢 Acc No: <code>{$accNo}</code>\n" : '')
-             . ($ifsc    ? "🏛 IFSC: <code>{$ifsc}</code>\n" : '')
-             . ($bankNm  ? "🏦 Bank: {$bankNm}\n" : '')
-             . "\n⚠️ <b>Send exact amount ₹" . number_format($amount) . " only</b>\n\n"
+             . "🔖 Txn ID: <code>{$txnId}</code>\n";
+
+    if ($upiId || $accNo) {
+        $bankMsg .= "\n<b>💳 Bank / UPI Details:</b>\n"
+                 . ($upiId   ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
+                 . ($accName ? "👤 Name: <b>{$accName}</b>\n" : '')
+                 . ($accNo   ? "🔢 Acc No: <code>{$accNo}</code>\n" : '')
+                 . ($ifsc    ? "🏛 IFSC: <code>{$ifsc}</code>\n" : '')
+                 . ($bankNm  ? "🏦 Bank: {$bankNm}\n" : '');
+    } else {
+        // No bank details — show payment page link directly
+        $bankMsg .= "\n🌐 <b>Payment Page:</b>\n<code>{$payPageUrl}</code>\n\n"
+                  . "<i>Open the link above to scan QR and pay</i>\n";
+    }
+
+    $bankMsg .= "\n⚠️ <b>Send exact amount ₹" . number_format($amount) . " only</b>\n\n"
              . "After payment, send your UTR number or screenshot here 👇";
 
     // ── QR / Screenshot ───────────────────────────────────────
@@ -704,13 +729,20 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
             }
         }
         if (!$upiQrSent) {
-            // Text only with UPI link
-            tgSend($token, $chatId, $bankMsg . "\n\n🔗 UPI Pay: <code>{$upiStr}</code>", $keyboard);
+            tgSend($token, $chatId,
+                $bankMsg
+                . "\n\n🔗 UPI Pay: <code>{$upiStr}</code>"
+                . "\n\n🌐 Payment Page: " . $payPageUrl,
+                $keyboard
+            );
             rbbLog("Text-only deposit sent — chat={$chatId} txn={$txnId}", 'info');
         }
     } else {
-        // No UPI ID — just send bank details
-        tgSend($token, $chatId, $bankMsg, $keyboard);
+        // No UPI ID — send bank details + payment page link
+        tgSend($token, $chatId,
+            $bankMsg . "\n\n🌐 Open this link to pay:\n" . $payPageUrl,
+            $keyboard
+        );
         rbbLog("Bank details sent (no UPI) — chat={$chatId} txn={$txnId}", 'info');
     }
 
