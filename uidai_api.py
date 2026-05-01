@@ -16,12 +16,13 @@ import re
 import tempfile
 import time
 
+import httpx
+
 try:
     from curl_cffi.requests import AsyncSession
     USE_CURL = True
 except ImportError:
     USE_CURL = False
-    import httpx
 
 from proxy_helper import get_working_indian_proxy
 
