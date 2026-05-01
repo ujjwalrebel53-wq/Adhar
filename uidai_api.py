@@ -20,6 +20,12 @@ from proxy_helper import get_working_indian_proxy
 
 logger = logging.getLogger(__name__)
 
+def _log_error(msg: str, exc: Exception = None):
+    full = f"[UIDAI] {msg}"
+    if exc:
+        full += f" | Exception: {type(exc).__name__}: {exc}"
+    logger.error(full)
+
 BASE     = "https://myaadhaar.uidai.gov.in"
 API_BASE = "https://myaadhaar.uidai.gov.in/api"   # Angular app's backend prefix — may vary
 
@@ -94,12 +100,15 @@ class UIDaiSession:
         self._fullname = fullname
 
         # Establish session — get cookies / XSRF token
+        logger.info(f"UIDAI page open kar raha hoon: {BASE}/retrieve-eid-uid | proxy: {self._proxy_url or 'none'}")
         try:
             r = await self.client.get(f"{BASE}/retrieve-eid-uid")
+            logger.info(f"UIDAI page response: HTTP {r.status_code} | size: {len(r.content)} bytes")
             r.raise_for_status()
         except Exception as e:
+            _log_error("Initial connection fail", e)
             # Try rotating proxy once on failure
-            logger.warning(f"Connection fail ({e}) — naya proxy try kar raha hoon...")
+            logger.warning("Naya proxy try kar raha hoon...")
             found = await get_working_indian_proxy(max_test=60)
             if found:
                 new_proxy = f"http://{found}"
@@ -114,8 +123,10 @@ class UIDaiSession:
                 )
                 try:
                     r = await self.client.get(f"{BASE}/retrieve-eid-uid")
+                    logger.info(f"Proxy se UIDAI: HTTP {r.status_code}")
                     r.raise_for_status()
                 except Exception as e2:
+                    _log_error("Proxy se bhi connection fail", e2)
                     return {"ok": False, "error": f"Proxy se bhi UIDAI nahi khuli: {e2}"}
             else:
                 return {"ok": False, "error": f"UIDAI site nahi khuli aur koi working proxy nahi mila. Server ka IP UIDAI ne block kar rakha hai."}

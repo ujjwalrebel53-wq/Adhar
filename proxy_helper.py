@@ -64,8 +64,12 @@ async def _test_proxy(proxy_str: str, timeout: int = 8) -> bool:
             follow_redirects=True,
         ) as client:
             r = await client.get(TEST_URL)
-            return r.status_code < 500
-    except Exception:
+            ok = r.status_code < 500
+            if ok:
+                logger.info(f"✅ Proxy working: {proxy_str} → HTTP {r.status_code}")
+            return ok
+    except Exception as e:
+        logger.debug(f"❌ Proxy fail: {proxy_str} → {e}")
         return False
 
 

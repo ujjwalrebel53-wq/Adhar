@@ -27,9 +27,15 @@ from telegram.ext import (
 
 from uidai_api import UIDaiSession
 
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adhar_logs.txt")
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
