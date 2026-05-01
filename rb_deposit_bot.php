@@ -276,30 +276,19 @@ function rbCreateDeposit($cfg, $userId, $amount, $mode = 'PowerPay') {
     return $d;
 }
 
-// ─── Get user by clientName ───────────────────────────────────
-function rbFindUser($cfg, $clientName) {
-    $res = rbApi('/user/getUsers?page=1&limit=100000');
-    if (!$res['ok']) return null;
-    $users = $res['data']['users'] ?? $res['data']['data'] ?? [];
-    if (!is_array($users)) return null;
-    foreach ($users as $u) {
-        if (strtolower($u['clientName'] ?? '') === strtolower($clientName)) return $u;
-    }
-    return null;
-}
 
-// ─── Get sub-account (user linked to their Telegram account) ─
-function rbGetLinkedUser($cfg, $tgChatId) {
-    // Check stored mapping
-    $states  = rbbGetStates();
-    $mapping = json_decode(file_exists(RBB_COOKIE_DIR . 'user_map.json') ? file_get_contents(RBB_COOKIE_DIR . 'user_map.json') : '{}', true) ?: [];
-    return $mapping[(string)$tgChatId] ?? null;
-}
-function rbLinkUser($tgChatId, $rbUserId, $rbUserName) {
-    $mapFile = RBB_COOKIE_DIR . 'user_map.json';
-    $mapping = json_decode(file_exists($mapFile) ? file_get_contents($mapFile) : '{}', true) ?: [];
-    $mapping[(string)$tgChatId] = ['id' => $rbUserId, 'clientName' => $rbUserName, 'ts' => time()];
-    file_put_contents($mapFile, json_encode($mapping, JSON_UNESCAPED_UNICODE), LOCK_EX);
+// ─── Get admin user info (cached after first login) ──────────
+function rbGetAdminUser($cfg) {
+    $cacheFile = RBB_COOKIE_DIR . 'admin_user.json';
+    if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < 3600) {
+        $cached = json_decode(file_get_contents($cacheFile), true);
+        if ($cached && isset($cached['_id'])) return $cached;
+    }
+    $user = rbAdminLogin($cfg);
+    if ($user && is_array($user)) {
+        file_put_contents($cacheFile, json_encode($user, JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+    return $user;
 }
 
 // ─── Generate QR code (PHP GD — no library needed) ───────────
@@ -336,28 +325,16 @@ function rbbGenerateQR($upiString, $outputFile) {
     return false;
 }
 
-// ─── Handle /Deposit command ──────────────────────────────────
+// ─── Handle /Deposit command — seedha amount poochta hai ─────
 function handleDeposit($token, $chatId, $userName, $cfg) {
-    $linked = rbGetLinkedUser($cfg, $chatId);
-
-    if (!$linked) {
-        // Ask user to provide their RockyBook username
-        tgSendPhoto_or_send($token, $chatId,
-            "🎯 <b>RockyBook Deposit</b>\n\n"
-          . "Pehle apna <b>RockyBook Username</b> enter karo taaki hum tumhara account link kar sakein:\n\n"
-          . "<i>(Wo username jo RockyBook pe create hua hai)</i>",
-        null);
-        rbbSetState($chatId, 'awaiting_rb_username', []);
-        return;
-    }
-
-    // Already linked — ask amount
     $minDep = (int)($cfg['min_deposit'] ?? MIN_DEPOSIT);
+    $maxDep = (int)($cfg['max_deposit'] ?? 100000);
+
     tgSend($token, $chatId,
         "💰 <b>Deposit Amount</b>\n\n"
       . "Kitna deposit karna chahte ho?\n"
       . "Minimum: <b>₹" . number_format($minDep) . "</b>\n"
-      . "Maximum: <b>₹" . number_format((int)($cfg['max_deposit'] ?? 100000)) . "</b>\n\n"
+      . "Maximum: <b>₹" . number_format($maxDep) . "</b>\n\n"
       . "<i>Sirf number daalo (e.g. 1000)</i>",
     [
         'inline_keyboard' => [
@@ -373,11 +350,7 @@ function handleDeposit($token, $chatId, $userName, $cfg) {
             ],
         ],
     ]);
-    rbbSetState($chatId, 'awaiting_amount', ['rb_user' => $linked]);
-}
-
-function tgSendPhoto_or_send($token, $chatId, $text, $keyboard) {
-    tgSend($token, $chatId, $text, $keyboard);
+    rbbSetState($chatId, 'awaiting_amount', []);
 }
 
 // ─── Process deposit amount → create txn → send QR ───────────
@@ -396,22 +369,22 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
 
     tgSend($token, $chatId, "⏳ <b>Processing...</b>\n\nTransaction create ho rahi hai RockyBook pe...");
 
-    // Login as admin
-    $user = rbAdminLogin($cfg);
-    if (!$user) {
+    // Login with panel credentials (admin ke RockyBook account se)
+    $adminUser = rbGetAdminUser($cfg);
+    if (!$adminUser) {
         tgSend($token, $chatId, "❌ Server error. Admin ko contact karo.");
-        rbbLog("Deposit failed: admin login failed for chat {$chatId}", 'error');
+        rbbLog("Deposit failed: admin RB login failed for chat {$chatId}", 'error');
         return false;
     }
 
-    // Get bank/UPI details
+    // Get bank/UPI details from admin's passbook
     $bankDetails = rbGetBankDetails($cfg);
     $upiId       = $bankDetails['upiId'] ?? $bankDetails['upi'] ?? null;
     $accHolder   = $bankDetails['accHolderName'] ?? $bankDetails['holderName'] ?? 'RockyBook';
     $bankName    = $bankDetails['bankName'] ?? '';
 
-    // Create transaction
-    $rbUserId = $rbUser['id'] ?? $rbUser['_id'] ?? null;
+    // Create transaction using admin's user ID
+    $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
     $txn = null;
     if ($rbUserId) {
         $txn = rbCreateDeposit($cfg, $rbUserId, $amount);
@@ -468,10 +441,10 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
 
     // Save pending deposit state
     rbbSetState($chatId, 'awaiting_utr', [
-        'rb_user' => $rbUser,
         'amount'  => $amount,
         'txn_id'  => $txnId,
         'upi_id'  => $upiId,
+        'tg_user' => $chatId,
     ]);
 
     // Notify admin
@@ -479,8 +452,7 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     if ($adminChatId) {
         tgSend($token, $adminChatId,
             "🆕 <b>New Deposit Initiated</b>\n\n"
-          . "👤 User: <code>" . ($rbUser['clientName'] ?? 'Unknown') . "</code>\n"
-          . "📊 TG Chat: <code>{$chatId}</code>\n"
+          . "📊 TG Chat ID: <code>{$chatId}</code>\n"
           . "💰 Amount: ₹" . number_format($amount) . "\n"
           . ($txnId ? "🔖 Txn ID: <code>{$txnId}</code>\n" : '')
           . "🕐 Time: " . date('d/m/Y H:i:s')
@@ -496,7 +468,6 @@ function processUtrSubmission($token, $chatId, $utr, $state, $cfg) {
     $data   = $state['data'] ?? [];
     $amount = $data['amount'] ?? 0;
     $txnId  = $data['txn_id'] ?? null;
-    $rbUser = $data['rb_user'] ?? [];
 
     $thankMsg = str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ UTR submit ho gayi! Admin verify karega.");
     tgSend($token, $chatId, $thankMsg);
@@ -508,7 +479,7 @@ function processUtrSubmission($token, $chatId, $utr, $state, $cfg) {
     if ($adminChatId) {
         tgSend($token, $adminChatId,
             "💳 <b>UTR Submitted</b>\n\n"
-          . "👤 User: <code>" . ($rbUser['clientName'] ?? 'Unknown') . "</code>\n"
+          . "📊 TG Chat ID: <code>{$chatId}</code>\n"
           . "💰 Amount: ₹" . number_format($amount) . "\n"
           . "🔢 UTR: <code>{$utr}</code>\n"
           . ($txnId ? "🔖 Txn ID: <code>{$txnId}</code>\n" : '')
@@ -536,14 +507,7 @@ function handleUpdate($update, $cfg) {
 
         if (str_starts_with($data, 'amt_')) {
             $amount = (int)substr($data, 4);
-            $state  = rbbGetState($chatId);
-            $rbUser = $state['data']['rb_user'] ?? null;
-            if (!$rbUser) {
-                tgSend($token, $chatId, "❌ Session expire ho gayi. Dobara /Deposit karein.");
-                return;
-            }
-            rbbSetState($chatId, 'awaiting_amount_confirm', ['rb_user' => $rbUser, 'amount' => $amount]);
-            processDepositAmount($token, $chatId, $amount, $rbUser, $cfg);
+            processDepositAmount($token, $chatId, $amount, [], $cfg);
             return;
         }
 
@@ -573,17 +537,15 @@ function handleUpdate($update, $cfg) {
 
     // Handle screenshot submission for UTR
     $state = rbbGetState($chatId);
-    if ($state && $state['state'] === 'awaiting_utr' && ($photo || $doc)) {
+    if ($state && in_array($state['state'], ['awaiting_utr', 'awaiting_utr_text']) && ($photo || $doc)) {
         $data   = $state['data'] ?? [];
         $amount = $data['amount'] ?? 0;
         $txnId  = $data['txn_id'] ?? null;
-        $rbUser = $data['rb_user'] ?? [];
         tgSend($token, $chatId, str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ Screenshot submit ho gayi! Admin verify karega."));
         rbbClearState($chatId);
 
         $adminChatId = trim($cfg['admin_chat_id'] ?? '');
         if ($adminChatId) {
-            // Forward screenshot to admin
             if ($photo) {
                 tg('forwardMessage', [
                     'chat_id'      => $adminChatId,
@@ -593,7 +555,7 @@ function handleUpdate($update, $cfg) {
             }
             tgSend($token, $adminChatId,
                 "📸 <b>Payment Screenshot Received</b>\n\n"
-              . "👤 User: <code>" . ($rbUser['clientName'] ?? 'Unknown') . "</code>\n"
+              . "📊 TG Chat ID: <code>{$chatId}</code>\n"
               . "💰 Amount: ₹" . number_format($amount) . "\n"
               . ($txnId ? "🔖 Txn ID: <code>{$txnId}</code>\n" : '')
             );
@@ -624,20 +586,19 @@ function handleUpdate($update, $cfg) {
     }
 
     if ($cmd === '/balance') {
-        $linked = rbGetLinkedUser($cfg, $chatId);
-        if (!$linked) {
-            tgSend($token, $chatId, "❌ Pehle /Deposit karo aur apna RockyBook account link karo.");
+        $adminUser = rbGetAdminUser($cfg);
+        if (!$adminUser) {
+            tgSend($token, $chatId, "❌ Server error. Admin ko contact karo.");
             return;
         }
-        rbAdminLogin($cfg);
-        $rbUserId = $linked['id'] ?? $linked['_id'] ?? null;
+        $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
         if ($rbUserId) {
             $res = rbApi("/transaction/get_MainUserBalance/{$rbUserId}");
             if ($res['ok']) {
-                $bal = $res['data']['balance'] ?? $res['data']['data'] ?? '—';
+                $bal = $res['data']['balance'] ?? $res['data']['currentBalance'] ?? $res['data']['data'] ?? '—';
                 tgSend($token, $chatId, "💳 <b>RockyBook Balance</b>\n\n₹" . (is_numeric($bal) ? number_format((float)$bal, 2) : $bal));
             } else {
-                tgSend($token, $chatId, "❌ Balance fetch karna mushkil ho gaya. Baad mein try karo.");
+                tgSend($token, $chatId, "❌ Balance fetch nahi ho saka. Baad mein try karo.");
             }
         }
         return;
@@ -647,7 +608,7 @@ function handleUpdate($update, $cfg) {
         tgSend($token, $chatId,
             "❓ <b>Help</b>\n\n"
           . "/Deposit — RockyBook pe deposit karo\n"
-          . "/Balance — Apna balance dekho\n"
+          . "/Balance — Balance dekho\n"
           . "/Start — Bot restart karo\n\n"
           . "Support ke liye admin se contact karo."
         );
@@ -662,43 +623,13 @@ function handleUpdate($update, $cfg) {
 
     switch ($state['state']) {
 
-        case 'awaiting_rb_username':
-            $clientName = trim($text);
-            if (strlen($clientName) < 2) {
-                tgSend($token, $chatId, "❌ Valid username daalo.");
-                return;
-            }
-            tgSend($token, $chatId, "⏳ Account dhundh raha hai...");
-            rbAdminLogin($cfg);
-            $rbUser = rbFindUser($cfg, $clientName);
-            if (!$rbUser) {
-                tgSend($token, $chatId, "❌ Username '<code>{$clientName}</code>' RockyBook pe nahi mila.\n\nSahi username check karke dobara bhejo.");
-                return;
-            }
-            $rbId = $rbUser['_id'] ?? $rbUser['id'] ?? null;
-            rbLinkUser($chatId, $rbId, $clientName);
-            tgSend($token, $chatId,
-                "✅ <b>Account Link Ho Gaya!</b>\n\n"
-              . "👤 RockyBook User: <b>{$clientName}</b>\n\n"
-              . "Ab /Deposit karke deposit karo."
-            );
-            rbbClearState($chatId);
-            rbbLog("User linked — tg={$chatId} rb={$clientName}", 'success');
-            break;
-
         case 'awaiting_amount':
             $amount = (float)preg_replace('/[^0-9.]/', '', $text);
             if ($amount <= 0) {
                 tgSend($token, $chatId, "❌ Valid amount daalo (sirf number).\n\nExample: <code>1000</code>");
                 return;
             }
-            $rbUser = $state['data']['rb_user'] ?? null;
-            if (!$rbUser) {
-                tgSend($token, $chatId, "❌ Session expire. Dobara /Deposit karo.");
-                rbbClearState($chatId);
-                return;
-            }
-            processDepositAmount($token, $chatId, (int)$amount, $rbUser, $cfg);
+            processDepositAmount($token, $chatId, (int)$amount, [], $cfg);
             break;
 
         case 'awaiting_utr':
@@ -810,10 +741,11 @@ if (isset($_GET['api_action'])) {
             $r = tgSend($tok, $cid, "✅ <b>RockyBook Deposit Bot</b> is working!\n\n" . date('d/m/Y H:i:s'));
             echo json_encode(['ok' => $r['ok'] ?? false]); exit;
 
-        case 'get_linked_users':
-            $mapFile = RBB_COOKIE_DIR . 'user_map.json';
-            $mapping = json_decode(file_exists($mapFile) ? file_get_contents($mapFile) : '{}', true) ?: [];
-            echo json_encode(['ok' => true, 'data' => $mapping, 'count' => count($mapping)]); exit;
+        case 'get_deposit_logs':
+            // Return last 50 deposit states/transactions from log
+            $logs = file_exists(RBB_LOG_FILE) ? (json_decode(file_get_contents(RBB_LOG_FILE), true) ?: []) : [];
+            $depLogs = array_values(array_filter($logs, fn($l) => str_contains($l['text'] ?? '', 'Deposit') || str_contains($l['text'] ?? '', 'UTR')));
+            echo json_encode(['ok' => true, 'data' => array_slice($depLogs, 0, 50), 'count' => count($depLogs)]); exit;
 
         case 'get_logs':
             $logs = file_exists(RBB_LOG_FILE) ? (json_decode(file_get_contents(RBB_LOG_FILE), true) ?: []) : [];
@@ -1063,18 +995,19 @@ async function sendTest(){
 }
 
 async function loadUsers(){
-  const r=await api('get_linked_users');
+  const r=await api('get_deposit_logs');
   const card=g('users-card');
   const body=g('users-body');
   card.style.display='block';
-  if(!r.ok||!Object.keys(r.data||{}).length){body.innerHTML='<div style="color:var(--td)">Koi bhi user link nahi hua abhi tak.</div>';return;}
+  if(!r.ok||!r.data?.length){body.innerHTML='<div style="color:var(--td)">Koi deposit log nahi abhi tak.</div>';return;}
   let rows='';
-  Object.entries(r.data).forEach(([tgId,info])=>{
-    const d=new Date((info.ts||0)*1000).toLocaleString();
-    rows+=`<tr><td class="mono">${esc(tgId)}</td><td><b>${esc(info.clientName||'?')}</b></td><td style="color:var(--td);font-size:11px">${d}</td></tr>`;
+  r.data.forEach(l=>{
+    const d=new Date(l.time).toLocaleString();
+    const cls=l.type==='success'?'log-ok':l.type==='error'?'log-err':'log-info';
+    rows+=`<tr><td style="color:var(--td);font-size:11px">${d}</td><td class="${cls}">${esc(l.text)}</td></tr>`;
   });
-  body.innerHTML=`<div style="margin-bottom:8px;font-size:12px;color:var(--td)">Total: <b>${r.count}</b> users linked</div>`
-    +`<table class="user-table"><thead><tr><th>Telegram Chat ID</th><th>RockyBook Username</th><th>Link Time</th></tr></thead><tbody>${rows}</tbody></table>`;
+  body.innerHTML=`<div style="margin-bottom:8px;font-size:12px;color:var(--td)">Deposit & UTR logs: <b>${r.count}</b></div>`
+    +`<table class="user-table"><thead><tr><th>Time</th><th>Log</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 async function loadLogs(){
