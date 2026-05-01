@@ -59,7 +59,7 @@ $defaultConfig = [
     'rb_phone'       => 'god',         // RockyBook login username
     'rb_password'    => '@Ujjwal0999',  // RockyBook account password
     'rb_branch'      => 'RBVIP1D',  // Branch name used in transactions
-    'rb_bank_id'     => '69ca38e87f96dde534afef82', // Default bank ID for UPI
+    'rb_bank_id'     => '', // Optional: specific bank ID (leave blank = auto-detect)
     'min_deposit'    => 500,
     'max_deposit'    => 100000,
     'welcome_msg'    => "🎯 <b>Rebel B2W</b>\n\nWelcome! Use this bot to make deposits quickly and easily.\n\n/Deposit — Start a deposit\n/Balance — Check balance\n/Help — Help",
@@ -272,50 +272,26 @@ function rbNormalizeBank($b) {
 }
 
 // ─── Get deposit bank details (real-time from RockyBook) ──────
-// Uses the same endpoint the site uses for the deposit QR page
 function rbGetBankDetails($cfg) {
-    $bankId = trim($cfg['rb_bank_id'] ?? '69ca38e87f96dde534afef82');
+    // Get the deposit user's ID (Ujjwal0999)
+    $depositUser = rbGetDepositUserId($cfg);
+    $uid = $depositUser['_id'] ?? $depositUser['id'] ?? null;
 
-    // Method 1 (PRIMARY): getActiveBankDetails — same endpoint site uses for deposit QR
-    $res = rbApi("/bank/getActiveBankDetails/{$bankId}");
-    rbbLog("getActiveBankDetails HTTP={$res['code']} data=" . mb_substr(json_encode($res['data']), 0, 200), 'info');
-    if ($res['ok'] && !empty($res['data'])) {
-        $d    = $res['data'];
-        $bank = $d['data'] ?? $d['bank'] ?? $d;
-        if (is_array($bank)) {
-            $n = rbNormalizeBank($bank);
-            if ($n) return $n;
-        }
-    }
-
-    // Method 2: getAllBanks_With_Pagination (page 1, limit 10) — pick first active
-    $res2 = rbApi("/bank/getAllBanks_With_Pagination/dummy?page=1&limit=10");
-    if (!$res2['ok']) {
-        // Try with admin user ID
-        $adminUser = rbGetAdminUser($cfg);
-        $uid = $adminUser['_id'] ?? $adminUser['id'] ?? 'dummy';
-        $res2 = rbApi("/bank/getAllBanks_With_Pagination/{$uid}?page=1&limit=10");
-    }
-    rbbLog("getAllBanks_With_Pagination HTTP={$res2['code']} data=" . mb_substr(json_encode($res2['data']), 0, 200), 'info');
-    if ($res2['ok'] && !empty($res2['data'])) {
-        $banks = $res2['data']['banks'] ?? $res2['data']['data'] ?? $res2['data'];
-        if (is_array($banks)) {
-            foreach ($banks as $b) {
-                $n = rbNormalizeBank($b);
-                if ($n) return $n;
-            }
-        }
-    }
-
-    // Method 3: getAllBanksWithoutPagination for admin user
-    $adminUser = $adminUser ?? rbGetAdminUser($cfg);
-    $uid = $adminUser['_id'] ?? $adminUser['id'] ?? null;
+    // ── Method 1: getAllBanksWithoutPagination for deposit user ─
     if ($uid) {
-        $res3 = rbApi("/bank/getAllBanksWithoutPagination/{$uid}");
-        rbbLog("getAllBanksWithoutPagination HTTP={$res3['code']} data=" . mb_substr(json_encode($res3['data']), 0, 200), 'info');
-        if ($res3['ok'] && !empty($res3['data'])) {
-            $banks = $res3['data']['banks'] ?? $res3['data']['data'] ?? $res3['data'];
-            if (is_array($banks)) {
+        $res = rbApi("/bank/getAllBanksWithoutPagination/{$uid}");
+        rbbLog("getAllBanksWithoutPagination uid={$uid} HTTP={$res['code']} data=" . mb_substr(json_encode($res['data']), 0, 300), 'info');
+        if ($res['ok'] && !empty($res['data'])) {
+            $banks = $res['data']['banks'] ?? $res['data']['data'] ?? $res['data'];
+            if (is_array($banks) && count($banks) > 0) {
+                // Prefer active bank
+                foreach ($banks as $b) {
+                    if (!empty($b['isActive'])) {
+                        $n = rbNormalizeBank($b);
+                        if ($n) return $n;
+                    }
+                }
+                // Any bank
                 foreach ($banks as $b) {
                     $n = rbNormalizeBank($b);
                     if ($n) return $n;
@@ -324,14 +300,44 @@ function rbGetBankDetails($cfg) {
         }
     }
 
-    // Method 4: getSavedBanks
-    $res4 = rbApi('/user/getSavedBanks');
-    rbbLog("getSavedBanks HTTP={$res4['code']} data=" . mb_substr(json_encode($res4['data']), 0, 200), 'info');
-    if ($res4['ok'] && !empty($res4['data'])) {
-        $banks = $res4['data']['data'] ?? $res4['data']['banks'] ?? $res4['data'];
-        if (is_array($banks)) {
+    // ── Method 2: getAllBanks_With_Pagination for deposit user ──
+    if ($uid) {
+        $res2 = rbApi("/bank/getAllBanks_With_Pagination/{$uid}?page=1&limit=20");
+        rbbLog("getAllBanks_With_Pagination HTTP={$res2['code']} data=" . mb_substr(json_encode($res2['data']), 0, 300), 'info');
+        if ($res2['ok'] && !empty($res2['data'])) {
+            $banks = $res2['data']['banks'] ?? $res2['data']['data'] ?? $res2['data'];
+            if (is_array($banks) && count($banks) > 0) {
+                foreach ($banks as $b) {
+                    $n = rbNormalizeBank($b);
+                    if ($n) return $n;
+                }
+            }
+        }
+    }
+
+    // ── Method 3: getSavedBanks ─────────────────────────────────
+    $res3 = rbApi('/user/getSavedBanks');
+    rbbLog("getSavedBanks HTTP={$res3['code']} data=" . mb_substr(json_encode($res3['data']), 0, 300), 'info');
+    if ($res3['ok'] && !empty($res3['data'])) {
+        $banks = $res3['data']['data'] ?? $res3['data']['banks'] ?? $res3['data'];
+        if (is_array($banks) && count($banks) > 0) {
             foreach ($banks as $b) {
                 $n = rbNormalizeBank($b);
+                if ($n) return $n;
+            }
+        }
+    }
+
+    // ── Method 4: getActiveBankDetails with configured bank ID ──
+    $bankId = trim($cfg['rb_bank_id'] ?? '');
+    if ($bankId) {
+        $res4 = rbApi("/bank/getActiveBankDetails/{$bankId}");
+        rbbLog("getActiveBankDetails HTTP={$res4['code']} data=" . mb_substr(json_encode($res4['data']), 0, 300), 'info');
+        if ($res4['ok'] && !empty($res4['data'])) {
+            $d    = $res4['data'];
+            $bank = $d['data'] ?? $d['bank'] ?? $d;
+            if (is_array($bank)) {
+                $n = rbNormalizeBank($bank);
                 if ($n) return $n;
             }
         }
