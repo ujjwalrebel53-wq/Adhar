@@ -56,8 +56,8 @@ $defaultConfig = [
     'admin_pass'     => 'rebel@2026',
     'bot_token'      => '',
     'admin_chat_id'  => '',      // Admin ko notifications jaati hain
-    'rb_phone'       => '',      // RockyBook login phone
-    'rb_password'    => '',      // RockyBook login password
+    'rb_phone'       => 'god',         // RockyBook login username
+    'rb_password'    => '@Ujjwal0999',  // RockyBook account password
     'rb_branch'      => 'RBVIP1D',  // Branch name used in transactions
     'rb_bank_id'     => '69ca38e87f96dde534afef82', // Default bank ID for UPI
     'min_deposit'    => 500,
@@ -1188,7 +1188,7 @@ document.getElementById('lpass').focus();
     <div style="background:rgba(255,107,26,.07);border:1px solid rgba(255,107,26,.25);border-radius:8px;padding:12px;margin-bottom:10px">
       <div style="color:var(--rb);font-size:12px;font-weight:700;margin-bottom:8px">🎯 Rebel B2W Account (Admin)</div>
       <div class="row">
-        <div class="f1"><label>📱 Phone (loginType)</label><input type="text" id="cfg-rbphone" placeholder="10-digit phone number"></div>
+        <div class="f1"><label>👤 Username / Phone (loginType)</label><input type="text" id="cfg-rbphone" placeholder="username or phone"></div>
         <div class="f1"><label>🔒 Password</label><input type="password" id="cfg-rbpass" placeholder="Account password"></div>
       </div>
       <div class="row">
