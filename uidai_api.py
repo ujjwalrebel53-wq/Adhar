@@ -15,7 +15,14 @@ import os
 import re
 import tempfile
 import time
-import httpx
+
+try:
+    from curl_cffi.requests import AsyncSession
+    USE_CURL = True
+except ImportError:
+    USE_CURL = False
+    import httpx
+
 from proxy_helper import get_working_indian_proxy
 
 logger = logging.getLogger(__name__)
@@ -62,24 +69,48 @@ class UIDaiSession:
         self._captcha_token: str = ""
 
     async def start(self, headless: bool = True, proxy: str = ""):
-        # Use manual proxy > env var > auto-fetch Indian proxy
         proxy_url = proxy or os.environ.get("UIDAI_PROXY", "")
-        if not proxy_url:
-            logger.info("Koi proxy set nahi — Indian proxy auto-fetch ho rahi hai...")
-            found = await get_working_indian_proxy(max_test=50)
-            if found:
-                proxy_url = f"http://{found}"
-                logger.info(f"Auto proxy use ho raha hai: {proxy_url}")
-            else:
-                logger.warning("Koi proxy nahi mila — direct connect try karega.")
         self._proxy_url = proxy_url
-        self.client = httpx.AsyncClient(
-            headers=HEADERS_COMMON,
-            follow_redirects=True,
-            timeout=40,
-            verify=False,
-            proxy=proxy_url if proxy_url else None,
-        )
+
+        if USE_CURL:
+            # curl_cffi — real Chrome TLS fingerprint, UIDAI bot detection bypass
+            logger.info("curl_cffi use ho raha hai (Chrome fingerprint mode)")
+            self.client = AsyncSession(
+                impersonate="chrome124",
+                verify=False,
+                timeout=40,
+                proxies={"https": proxy_url, "http": proxy_url} if proxy_url else None,
+            )
+            self._use_curl = True
+        else:
+            logger.info("curl_cffi nahi mila — httpx use ho raha hai")
+            self._use_curl = False
+            if not proxy_url:
+                logger.info("Proxy auto-fetch ho rahi hai...")
+                found = await get_working_indian_proxy(max_test=50)
+                if found:
+                    proxy_url = f"http://{found}"
+                    self._proxy_url = proxy_url
+                    logger.info(f"Auto proxy: {proxy_url}")
+                else:
+                    logger.warning("Koi proxy nahi mila — direct try karega")
+            self.client = httpx.AsyncClient(
+                headers=HEADERS_COMMON,
+                follow_redirects=True,
+                timeout=40,
+                verify=False,
+                proxy=proxy_url if proxy_url else None,
+            )
+
+    async def _get(self, url, **kwargs):
+        if self._use_curl:
+            return await self.client.get(url, headers=HEADERS_COMMON, **kwargs)
+        return await self.client.get(url, **kwargs)
+
+    async def _post(self, url, **kwargs):
+        if self._use_curl:
+            return await self.client.post(url, headers=HEADERS_COMMON, **kwargs)
+        return await self.client.post(url, **kwargs)
 
     async def close(self):
         if self.client:
@@ -100,49 +131,24 @@ class UIDaiSession:
         self._fullname = fullname
 
         # Establish session — get cookies / XSRF token
-        logger.info(f"UIDAI page open kar raha hoon: {BASE}/retrieve-eid-uid | proxy: {self._proxy_url or 'none'}")
+        logger.info(f"UIDAI page open kar raha hoon | proxy: {self._proxy_url or 'none'} | curl_cffi: {self._use_curl}")
         try:
-            r = await self.client.get(f"{BASE}/retrieve-eid-uid")
+            r = await self._get(f"{BASE}/retrieve-eid-uid")
             logger.info(f"UIDAI page response: HTTP {r.status_code} | size: {len(r.content)} bytes")
-            r.raise_for_status()
         except Exception as e:
-            _log_error("Initial connection fail", e)
-            # Try rotating proxy once on failure
-            logger.warning("Naya proxy try kar raha hoon...")
-            found = await get_working_indian_proxy(max_test=60)
-            if found:
-                new_proxy = f"http://{found}"
-                logger.info(f"Naya proxy: {new_proxy}")
-                await self.client.aclose()
-                self.client = httpx.AsyncClient(
-                    headers=HEADERS_COMMON,
-                    follow_redirects=True,
-                    timeout=40,
-                    verify=False,
-                    proxy=new_proxy,
-                )
-                try:
-                    r = await self.client.get(f"{BASE}/retrieve-eid-uid")
-                    logger.info(f"Proxy se UIDAI: HTTP {r.status_code}")
-                    r.raise_for_status()
-                except Exception as e2:
-                    _log_error("Proxy se bhi connection fail", e2)
-                    return {"ok": False, "error": f"Proxy se bhi UIDAI nahi khuli: {e2}"}
-            else:
-                return {"ok": False, "error": f"UIDAI site nahi khuli aur koi working proxy nahi mila. Server ka IP UIDAI ne block kar rakha hai."}
+            _log_error("Connection fail", e)
+            return {"ok": False, "error": f"UIDAI site nahi khuli: {e}"}
 
-        # Extract XSRF / CSRF token from cookie or response body
-        self._csrf = (
-            self.client.cookies.get("XSRF-TOKEN")
-            or self.client.cookies.get("csrftoken")
-            or self.client.cookies.get("_csrf")
-            or ""
-        )
-        if self._csrf:
-            self.client.headers.update({
-                "X-XSRF-TOKEN": self._csrf,
-                "X-CSRF-Token": self._csrf,
-            })
+        # Extract XSRF / CSRF token from cookies
+        try:
+            cookies = dict(r.cookies) if hasattr(r, 'cookies') else {}
+            self._csrf = (
+                cookies.get("XSRF-TOKEN") or cookies.get("csrftoken") or cookies.get("_csrf") or ""
+            )
+            if self._csrf:
+                logger.info(f"CSRF token mila: {self._csrf[:20]}...")
+        except Exception:
+            self._csrf = ""
 
         # Fetch captcha
         return await self._fetch_captcha()
@@ -152,8 +158,8 @@ class UIDaiSession:
         endpoints_to_try = [EP_CAPTCHA, EP_CAPTCHA_ALT]
         for ep in endpoints_to_try:
             try:
-                params = {"ts": int(time.time() * 1000)}  # cache-bust
-                r = await self.client.get(ep, params=params)
+                params = {"ts": int(time.time() * 1000)}
+                r = await self._get(ep, params=params)
                 ct = r.headers.get("content-type", "")
                 if r.status_code == 200 and "image" in ct:
                     return {"ok": True, "captcha_image": r.content}
@@ -201,7 +207,7 @@ class UIDaiSession:
         endpoints_to_try = [EP_SEND_OTP, EP_SEND_OTP_ALT]
         for ep in endpoints_to_try:
             try:
-                r = await self.client.post(ep, json=payload)
+                r = await self._post(ep, json=payload)
                 data = self._parse_json_safe(r)
                 logger.info(f"sendOtp [{ep}] → {r.status_code} | {data}")
 
@@ -242,7 +248,7 @@ class UIDaiSession:
         endpoints_to_try = [EP_VERIFY_OTP, EP_VERIFY_OTP_ALT]
         for ep in endpoints_to_try:
             try:
-                r = await self.client.post(ep, json=payload)
+                r = await self._post(ep, json=payload)
                 data = self._parse_json_safe(r)
                 logger.info(f"verifyOtp [{ep}] → {r.status_code} | {data}")
 
@@ -278,7 +284,7 @@ class UIDaiSession:
                 or ""
             )
             params = {"token": dl_token} if dl_token else {}
-            r = await self.client.get(EP_DOWNLOAD, params=params, timeout=40)
+            r = await self._get(EP_DOWNLOAD, params=params)
             ct = r.headers.get("content-type", "")
             if r.status_code == 200 and "pdf" in ct:
                 path = os.path.join(self.temp_dir, "aadhaar.pdf")
