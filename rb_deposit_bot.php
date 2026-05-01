@@ -56,7 +56,7 @@ $defaultConfig = [
     'rb_bank_id'     => '69ca38e87f96dde534afef82', // Default bank ID for UPI
     'min_deposit'    => 500,
     'max_deposit'    => 100000,
-    'welcome_msg'    => "🎯 <b>RockyBook Deposit Bot</b>\n\nNamaste! Is bot ke zariye aap seedha RockyBook pe deposit kar sakte ho.\n\n/Deposit — Deposit shuru karo\n/Balance — Balance dekho\n/Help — Help",
+    'welcome_msg'    => "🎯 <b>Rebel B2W</b>\n\nNamaste! Is bot ke zariye aap seedha Rebel B2W pe deposit kar sakte ho.\n\n/Deposit — Deposit shuru karo\n/Balance — Balance dekho\n/Help — Help",
     'deposit_thanks' => "✅ <b>Transaction Submit Ho Gayi!</b>\n\nAdmin jald hi verify karega. Koi pareshani ho to support se contact karo.",
 ];
 
@@ -542,7 +542,7 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
         return false;
     }
 
-    tgSend($token, $chatId, "⏳ <b>Processing...</b>\n\nRockyBook pe deposit request create ho rahi hai...");
+    tgSend($token, $chatId, "⏳ <b>Processing...</b>\n\nRebel B2W pe deposit request create ho rahi hai...");
 
     // Login with panel credentials
     $adminUser = rbGetAdminUser($cfg);
@@ -587,7 +587,7 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     ];
 
     // ── Full bank details message (always send this) ──────────
-    $bankMsg = "🎯 <b>RockyBook Deposit Details</b>\n\n"
+    $bankMsg = "🎯 <b>Rebel B2W Deposit Details</b>\n\n"
              . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
              . "🔖 Txn ID: <code>{$txnId}</code>\n"
              . "\n<b>💳 Bank / UPI Details:</b>\n"
@@ -610,7 +610,7 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
 
     if ($qrSource && file_exists($qrFile) && filesize($qrFile) > 500) {
         // Send screenshot with bank details caption
-        $caption = "📸 <b>Payment QR — RockyBook</b>\n\n"
+        $caption = "📸 <b>Payment QR — Rebel B2W</b>\n\n"
                  . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
                  . ($upiId ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
                  . "🔖 Txn ID: <code>{$txnId}</code>";
@@ -626,7 +626,7 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
 
     // Step 2: Generate UPI QR from UPI ID (if screenshot failed)
     if ($upiId) {
-        $upiStr = "upi://pay?pa={$upiId}&am={$amount}&cu=INR&tn=RockyBook";
+        $upiStr = "upi://pay?pa={$upiId}&am={$amount}&cu=INR&tn=RebelB2W";
         $upiQrFile = RBB_QR_DIR . 'upi_' . $chatId . '_' . time() . '.png';
         $qrApis = [
             "https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=" . urlencode($upiStr),
@@ -795,7 +795,7 @@ function handleUpdate($update, $cfg) {
     $cmd = strtolower(explode('@', explode(' ', $text)[0])[0]);
 
     if ($cmd === '/start') {
-        $welcome = str_replace('\n', "\n", $cfg['welcome_msg'] ?? "Welcome to RockyBook Bot!");
+        $welcome = str_replace('\n', "\n", $cfg['welcome_msg'] ?? "Welcome to Rebel B2W!");
         tgSend($token, $chatId, $welcome, [
             'keyboard' => [
                 [['text' => '💰 Deposit'], ['text' => '❓ Help']],
@@ -823,7 +823,7 @@ function handleUpdate($update, $cfg) {
             $res = rbApi("/transaction/get_MainUserBalance/{$rbUserId}");
             if ($res['ok']) {
                 $bal = $res['data']['balance'] ?? $res['data']['currentBalance'] ?? $res['data']['data'] ?? '—';
-                tgSend($token, $chatId, "💳 <b>RockyBook Balance</b>\n\n₹" . (is_numeric($bal) ? number_format((float)$bal, 2) : $bal));
+                tgSend($token, $chatId, "💳 <b>Rebel B2W Balance</b>\n\n₹" . (is_numeric($bal) ? number_format((float)$bal, 2) : $bal));
             } else {
                 tgSend($token, $chatId, "❌ Balance fetch nahi ho saka. Baad mein try karo.");
             }
@@ -834,7 +834,7 @@ function handleUpdate($update, $cfg) {
     if ($cmd === '/help' || $text === '❓ Help') {
         tgSend($token, $chatId,
             "❓ <b>Help</b>\n\n"
-          . "/Deposit — RockyBook pe deposit karo\n"
+          . "/Deposit — Rebel B2W pe deposit karo\n"
           . "/Balance — Balance dekho\n"
           . "/Start — Bot restart karo\n\n"
           . "Support ke liye admin se contact karo."
@@ -997,7 +997,7 @@ if (isset($_GET['api_action'])) {
             $cid = trim($body['chat_id'] ?? $cfg['admin_chat_id'] ?? '');
             $tok = trim($cfg['bot_token'] ?? '');
             if (!$cid || !$tok) { echo json_encode(['ok' => false, 'error' => 'Bot token / chat_id missing']); exit; }
-            $r = tgSend($tok, $cid, "✅ <b>RockyBook Deposit Bot</b> is working!\n\n" . date('d/m/Y H:i:s'));
+            $r = tgSend($tok, $cid, "✅ <b>Rebel B2W</b> is working!\n\n" . date('d/m/Y H:i:s'));
             echo json_encode(['ok' => $r['ok'] ?? false]); exit;
 
         case 'get_deposit_logs':
@@ -1028,7 +1028,7 @@ header('X-Content-Type-Options: nosniff');
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RockyBook Deposit Bot <?= RBB_VERSION ?></title>
+<title>Rebel B2W <?= RBB_VERSION ?></title>
 <style>
 :root{--bg:#0e0e12;--s1:#15151c;--s2:#1c1c26;--b:#2a2a3a;--t:#e8e8f0;--td:#8888aa;--tf:#555577;--c:#7c7cff;--g:#39ff14;--r:#ff4466;--y:#ffd700;--or:#ff8c00;--rb:#ff6b1a}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1076,7 +1076,7 @@ textarea{resize:vertical;min-height:60px;font-size:12px}
 <?php if (!$isLoggedIn): ?>
 <div class="login-wrap">
   <div class="login-box">
-    <h2>💰 RockyBook Deposit Bot</h2>
+    <h2>💰 Rebel B2W</h2>
     <p>Admin Panel — Bot Configuration</p>
     <div style="margin-bottom:12px"><label>Password</label><input type="password" id="lpass" placeholder="Admin password" onkeydown="if(event.key==='Enter')doLogin()"></div>
     <button class="btn brb" style="width:100%" onclick="doLogin()">🔓 Login</button>
@@ -1097,11 +1097,11 @@ document.getElementById('lpass').focus();
 <?php exit; endif; ?>
 
 <div class="wrap">
-  <h1>💰 RockyBook Deposit Bot <small style="font-size:13px;color:var(--td)">v<?= RBB_VERSION ?></small></h1>
+  <h1>💰 Rebel B2W <small style="font-size:13px;color:var(--td)">v<?= RBB_VERSION ?></small></h1>
   <div class="sub">Telegram bot — Users deposit karte hain, QR code automatically milta hai | <a href="?api_action=logout" style="color:var(--r)">Logout</a></div>
 
   <div class="info-box">
-    ✅ <b>Bot Flow:</b> User /Deposit → RockyBook username link → Amount enter karo → QR code + UPI ID automatically aata hai → User pay karta hai → UTR/screenshot bhejta hai → Admin ko notification
+    ✅ <b>Bot Flow: User /Deposit → Amount enter karo → Amount enter karo → QR code + UPI ID automatically aata hai → User pay karta hai → UTR/screenshot bhejta hai → Admin ko notification
   </div>
 
   <!-- Action Bar -->
@@ -1140,7 +1140,7 @@ document.getElementById('lpass').focus();
     </div>
 
     <div style="background:rgba(255,107,26,.07);border:1px solid rgba(255,107,26,.25);border-radius:8px;padding:12px;margin-bottom:10px">
-      <div style="color:var(--rb);font-size:12px;font-weight:700;margin-bottom:8px">🎯 RockyBook Account (Admin)</div>
+      <div style="color:var(--rb);font-size:12px;font-weight:700;margin-bottom:8px">🎯 Rebel B2W Account (Admin)</div>
       <div class="row">
         <div class="f1"><label>📱 Phone (loginType)</label><input type="text" id="cfg-rbphone" placeholder="10-digit phone number"></div>
         <div class="f1"><label>🔒 Password</label><input type="password" id="cfg-rbpass" placeholder="Account password"></div>
@@ -1247,7 +1247,7 @@ async function removeWebhook(){
 }
 
 async function testRbLogin(){
-  toast('Testing RockyBook login...','info');
+  toast('Testing Rebel B2W login...','info');
   const r=await api('test_rb_login');
   if(r.ok){ const u=r.user||{}; toast('✅ Login OK! '+( u.clientName||JSON.stringify(u).slice(0,60)),'success'); }
   else toast('❌ '+( r.error||'Login failed'),'error');
