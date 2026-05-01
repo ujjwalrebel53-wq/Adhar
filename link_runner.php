@@ -228,7 +228,9 @@ function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
     $data = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $ct   = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    $err  = curl_error($ch);
     curl_close($ch);
+    lrLog("SS-DEBUG thum.io → HTTP {$code}, CT: {$ct}, bytes: " . strlen((string)$data) . ($err ? ", err: {$err}" : ''), 'info');
     if ($code === 200 && $data && str_contains((string)$ct, 'image')) {
         return ['bytes' => $data, 'source' => 'thum.io'];
     }
@@ -247,9 +249,11 @@ function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
         CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
     ]);
     $raw = curl_exec($ch);
+    $mlErr = curl_error($ch);
     curl_close($ch);
     $mlData = json_decode($raw, true);
     $ssUrl = $mlData['data']['screenshot']['url'] ?? ($mlData['data']['screenshot'] ?? null);
+    lrLog("SS-DEBUG microlink → ssUrl: " . ($ssUrl ?: 'none') . ($mlErr ? ", err: {$mlErr}" : ''), 'info');
     if ($ssUrl && str_starts_with($ssUrl, 'http')) {
         $ch = curl_init();
         curl_setopt_array($ch, [
@@ -261,25 +265,35 @@ function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
         ]);
         $imgData = curl_exec($ch);
         $imgCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $imgErr  = curl_error($ch);
         curl_close($ch);
+        lrLog("SS-DEBUG microlink img fetch → HTTP {$imgCode}, bytes: " . strlen((string)$imgData) . ($imgErr ? ", err: {$imgErr}" : ''), 'info');
         if ($imgCode === 200 && $imgData) {
             return ['bytes' => $imgData, 'source' => 'microlink'];
         }
     }
 
+    lrLog('SS-DEBUG all APIs failed, returning null', 'error');
     return null;
 }
 
 function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
-    if (!$token || !$chatId) return false;
+    if (!$token || !$chatId) {
+        lrLog('SS-DEBUG lrTakeScreenshot: missing token or chatId', 'error');
+        return false;
+    }
 
     $result = lrFetchScreenshotBytes($url, $timeout);
-    if (!$result) return false;
+    if (!$result) {
+        lrLog('SS-DEBUG lrTakeScreenshot: lrFetchScreenshotBytes returned null', 'error');
+        return false;
+    }
 
     $ssFile = LR_SS_DIR . 'ss_' . md5($url . microtime()) . '.png';
     file_put_contents($ssFile, $result['bytes']);
 
     if (!file_exists($ssFile) || filesize($ssFile) < 500) {
+        lrLog('SS-DEBUG lrTakeScreenshot: saved file missing or too small (' . (file_exists($ssFile) ? filesize($ssFile) : 0) . ' bytes)', 'error');
         @unlink($ssFile);
         return false;
     }
@@ -300,13 +314,14 @@ function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
             'photo'      => new CURLFile($ssFile, 'image/png', 'screenshot.png'),
         ],
     ]);
-    $r = json_decode(curl_exec($ch), true);
+    $rawR = curl_exec($ch);
     curl_close($ch);
     @unlink($ssFile);
+    $r = json_decode($rawR, true);
+    lrLog('SS-DEBUG Telegram sendPhoto (file) → ' . ($r['ok'] ? 'ok' : ('FAIL: ' . ($r['description'] ?? $rawR))), $r['ok'] ? 'info' : 'error');
 
     // If file upload failed (Telegram rejected PNG), try sending as URL directly
     if (empty($r['ok'])) {
-        // Try sending the screenshot URL directly as a photo URL (microlink/thum.io)
         $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/' . urlencode($url);
         $r2 = lrTg('sendPhoto', [
             'chat_id'    => $chatId,
@@ -314,6 +329,7 @@ function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
             'caption'    => $caption,
             'parse_mode' => 'HTML',
         ], $token);
+        lrLog('SS-DEBUG Telegram sendPhoto (URL fallback) → ' . ($r2['ok'] ? 'ok' : ('FAIL: ' . ($r2['description'] ?? json_encode($r2)))), $r2['ok'] ? 'info' : 'error');
         return !empty($r2['ok']);
     }
 
