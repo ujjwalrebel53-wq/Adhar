@@ -56,8 +56,8 @@ $defaultConfig = [
     'rb_bank_id'     => '69ca38e87f96dde534afef82', // Default bank ID for UPI
     'min_deposit'    => 500,
     'max_deposit'    => 100000,
-    'welcome_msg'    => "🎯 <b>Rebel B2W</b>\n\nNamaste! Is bot ke zariye aap seedha Rebel B2W pe deposit kar sakte ho.\n\n/Deposit — Deposit shuru karo\n/Balance — Balance dekho\n/Help — Help",
-    'deposit_thanks' => "✅ <b>Transaction Submit Ho Gayi!</b>\n\nAdmin jald hi verify karega. Koi pareshani ho to support se contact karo.",
+    'welcome_msg'    => "🎯 <b>Rebel B2W</b>\n\nWelcome! Use this bot to make deposits quickly and easily.\n\n/Deposit — Start a deposit\n/Balance — Check balance\n/Help — Help",
+    'deposit_thanks' => "✅ <b>Transaction Submitted!</b>\n\nAdmin will verify shortly. Contact support if you need help.",
 ];
 
 // ─── Load/Save config ────────────────────────────────────────
@@ -409,10 +409,10 @@ function handleDeposit($token, $chatId, $userName, $cfg) {
 
     tgSend($token, $chatId,
         "💰 <b>Deposit Amount</b>\n\n"
-      . "Kitna deposit karna chahte ho?\n"
-      . "Minimum: <b>₹" . number_format($minDep) . "</b>\n"
-      . "Maximum: <b>₹" . number_format($maxDep) . "</b>\n\n"
-      . "<i>Sirf number daalo (e.g. 1000)</i>",
+      . "How much do you want to deposit?\n"
+        . "Minimum: <b>₹" . number_format($minDep) . "</b>\n"
+        . "Maximum: <b>₹" . number_format($maxDep) . "</b>\n\n"
+        . "<i>Enter amount only (e.g. 1000)</i>",
     [
         'inline_keyboard' => [
             [
@@ -534,20 +534,20 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     $maxDep = (int)($cfg['max_deposit'] ?? 100000);
 
     if ($amount < $minDep) {
-        tgSend($token, $chatId, "❌ Minimum deposit amount <b>₹" . number_format($minDep) . "</b> hai.\n\nDobara try karo:");
+        tgSend($token, $chatId, "❌ Minimum deposit amount is <b>₹" . number_format($minDep) . "</b>.\n\nPlease try again:");
         return false;
     }
     if ($amount > $maxDep) {
-        tgSend($token, $chatId, "❌ Maximum deposit amount <b>₹" . number_format($maxDep) . "</b> hai.\n\nDobara try karo:");
+        tgSend($token, $chatId, "❌ Maximum deposit amount is <b>₹" . number_format($maxDep) . "</b>.\n\nPlease try again:");
         return false;
     }
 
-    tgSend($token, $chatId, "⏳ <b>Processing...</b>\n\nRebel B2W pe deposit request create ho rahi hai...");
+    tgSend($token, $chatId, "⏳ <b>Processing...</b>\n\nCreating deposit request...");
 
     // Login with panel credentials
     $adminUser = rbGetAdminUser($cfg);
     if (!$adminUser) {
-        tgSend($token, $chatId, "❌ Server error. Admin ko contact karo.");
+        tgSend($token, $chatId, "❌ Server error. Please contact admin.");
         rbbLog("Deposit failed: admin RB login failed for chat {$chatId}", 'error');
         return false;
     }
@@ -555,13 +555,13 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
     $branch   = trim($cfg['rb_branch'] ?? 'RBVIP1D');
 
-    // Create transaction on RockyBook (same as clicking Deposit button on site)
+    // Create transaction on site
     $txn   = rbCreateDeposit($cfg, $rbUserId, $amount);
     $txnId = $txn['_id'] ?? $txn['id'] ?? $txn['transactionId'] ?? null;
     $mode  = $txn['mode'] ?? 'PowerPay';
 
     if (!$txnId) {
-        tgSend($token, $chatId, "❌ Transaction create nahi ho saki. Thodi der baad try karo.");
+        tgSend($token, $chatId, "❌ Transaction could not be created. Please try again later.");
         rbbLog("Deposit failed: no txnId — chat={$chatId} amount={$amount} txn=" . json_encode($txn), 'error');
         return false;
     }
@@ -582,7 +582,7 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     // ── Build keyboard ────────────────────────────────────────
     $keyboard = [
         'inline_keyboard' => [[
-            ['text' => '✅ Payment Ho Gayi — UTR Bhejo', 'callback_data' => 'submit_utr_' . $txnId],
+            ['text' => '✅ Payment Done — Submit UTR', 'callback_data' => 'submit_utr_' . $txnId],
         ]],
     ];
 
@@ -596,11 +596,11 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
              . ($accNo   ? "🔢 Acc No: <code>{$accNo}</code>\n" : '')
              . ($ifsc    ? "🏛 IFSC: <code>{$ifsc}</code>\n" : '')
              . ($bankNm  ? "🏦 Bank: {$bankNm}\n" : '')
-             . "\n⚠️ <b>Sirf ₹" . number_format($amount) . " hi bhejo (exact amount)</b>\n\n"
-             . "Payment ke baad UTR number ya screenshot yahan bhejo 👇";
+             . "\n⚠️ <b>Send exact amount ₹" . number_format($amount) . " only</b>\n\n"
+             . "After payment, send your UTR number or screenshot here 👇";
 
     // ── QR / Screenshot ───────────────────────────────────────
-    tgSend($token, $chatId, "⏳ QR code le raha hai...");
+    tgSend($token, $chatId, "⏳ Fetching payment QR...");
 
     $qrFile = RBB_QR_DIR . 'qr_' . $chatId . '_' . time() . '.png';
     sleep(3); // payment page initialize hone do
@@ -613,7 +613,8 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
         $caption = "📸 <b>Payment QR — Rebel B2W</b>\n\n"
                  . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
                  . ($upiId ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
-                 . "🔖 Txn ID: <code>{$txnId}</code>";
+                 . "🔖 Txn ID: <code>{$txnId}</code>\n"
+                 . "\n⚠️ Send exact amount ₹" . number_format($amount) . " only";
         $r = tgSendPhoto($token, $chatId, $qrFile, $caption, null);
         @unlink($qrFile);
         if (!empty($r['ok'])) {
@@ -696,7 +697,7 @@ function processUtrSubmission($token, $chatId, $utr, $state, $cfg) {
     $amount = $data['amount'] ?? 0;
     $txnId  = $data['txn_id'] ?? null;
 
-    $thankMsg = str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ UTR submit ho gayi! Admin verify karega.");
+    $thankMsg = str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ UTR submitted! Admin will verify shortly.");
     tgSend($token, $chatId, $thankMsg);
 
     rbbClearState($chatId);
@@ -741,7 +742,7 @@ function handleUpdate($update, $cfg) {
         if (str_starts_with($data, 'submit_utr_')) {
             $state = rbbGetState($chatId);
             if ($state && $state['state'] === 'awaiting_utr') {
-                tgSend($token, $chatId, "🔢 <b>UTR Number daalo:</b>\n\n<i>Bank app mein transaction ID / UTR / reference number hota hai</i>");
+                tgSend($token, $chatId, "🔢 <b>Enter UTR Number:</b>\n\n<i>This is the transaction ID / UTR / reference number from your bank app</i>");
                 rbbSetState($chatId, 'awaiting_utr_text', $state['data']);
             }
             return;
@@ -768,7 +769,7 @@ function handleUpdate($update, $cfg) {
         $data   = $state['data'] ?? [];
         $amount = $data['amount'] ?? 0;
         $txnId  = $data['txn_id'] ?? null;
-        tgSend($token, $chatId, str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ Screenshot submit ho gayi! Admin verify karega."));
+        tgSend($token, $chatId, str_replace('\n', "\n", $cfg['deposit_thanks'] ?? "✅ Screenshot received! Admin will verify shortly."));
         rbbClearState($chatId);
 
         $adminChatId = trim($cfg['admin_chat_id'] ?? '');
@@ -803,6 +804,7 @@ function handleUpdate($update, $cfg) {
             'resize_keyboard'   => true,
             'one_time_keyboard' => false,
         ]);
+
         rbbClearState($chatId);
         return;
     }
@@ -815,36 +817,36 @@ function handleUpdate($update, $cfg) {
     if ($cmd === '/balance') {
         $adminUser = rbGetAdminUser($cfg);
         if (!$adminUser) {
-            tgSend($token, $chatId, "❌ Server error. Admin ko contact karo.");
-            return;
+        tgSend($token, $chatId, "❌ Server error. Please contact admin.");
+        return;
+    }
+    $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
+    if ($rbUserId) {
+        $res = rbApi("/transaction/get_MainUserBalance/{$rbUserId}");
+        if ($res['ok']) {
+            $bal = $res['data']['balance'] ?? $res['data']['currentBalance'] ?? $res['data']['data'] ?? '—';
+            tgSend($token, $chatId, "💳 <b>Rebel B2W Balance</b>\n\n₹" . (is_numeric($bal) ? number_format((float)$bal, 2) : $bal));
+        } else {
+            tgSend($token, $chatId, "❌ Could not fetch balance. Please try again later.");
         }
-        $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
-        if ($rbUserId) {
-            $res = rbApi("/transaction/get_MainUserBalance/{$rbUserId}");
-            if ($res['ok']) {
-                $bal = $res['data']['balance'] ?? $res['data']['currentBalance'] ?? $res['data']['data'] ?? '—';
-                tgSend($token, $chatId, "💳 <b>Rebel B2W Balance</b>\n\n₹" . (is_numeric($bal) ? number_format((float)$bal, 2) : $bal));
-            } else {
-                tgSend($token, $chatId, "❌ Balance fetch nahi ho saka. Baad mein try karo.");
-            }
-        }
+    }
         return;
     }
 
     if ($cmd === '/help' || $text === '❓ Help') {
         tgSend($token, $chatId,
             "❓ <b>Help</b>\n\n"
-          . "/Deposit — Rebel B2W pe deposit karo\n"
-          . "/Balance — Balance dekho\n"
-          . "/Start — Bot restart karo\n\n"
-          . "Support ke liye admin se contact karo."
+          . "/Deposit — Make a deposit\n"
+          . "/Balance — Check your balance\n"
+          . "/Start — Restart bot\n\n"
+          . "Contact admin for support."
         );
         return;
     }
 
     // State machine
     if (!$state) {
-        tgSend($token, $chatId, "👇 Kya karna chahte ho?\n\n/Deposit — Deposit karo\n/Balance — Balance dekho\n/Help — Madad lao");
+        tgSend($token, $chatId, "👇 What would you like to do?\n\n/Deposit — Make a deposit\n/Balance — Check balance\n/Help — Get help");
         return;
     }
 
@@ -853,7 +855,7 @@ function handleUpdate($update, $cfg) {
         case 'awaiting_amount':
             $amount = (float)preg_replace('/[^0-9.]/', '', $text);
             if ($amount <= 0) {
-                tgSend($token, $chatId, "❌ Valid amount daalo (sirf number).\n\nExample: <code>1000</code>");
+                tgSend($token, $chatId, "❌ Please enter a valid amount (numbers only).\n\nExample: <code>1000</code>");
                 return;
             }
             processDepositAmount($token, $chatId, (int)$amount, [], $cfg);
@@ -863,7 +865,7 @@ function handleUpdate($update, $cfg) {
         case 'awaiting_utr_text':
             $utr = trim(preg_replace('/[^a-zA-Z0-9]/', '', $text));
             if (strlen($utr) < 6) {
-                tgSend($token, $chatId, "❌ Valid UTR/reference number daalo.");
+                tgSend($token, $chatId, "❌ Please enter a valid UTR / reference number.");
                 return;
             }
             processUtrSubmission($token, $chatId, $utr, $state, $cfg);
@@ -871,7 +873,7 @@ function handleUpdate($update, $cfg) {
 
         default:
             rbbClearState($chatId);
-            tgSend($token, $chatId, "👇 /Deposit — Deposit karo\n/Balance — Balance dekho");
+            tgSend($token, $chatId, "👇 /Deposit — Make a deposit\n/Balance — Check balance");
     }
 }
 
@@ -1101,7 +1103,7 @@ document.getElementById('lpass').focus();
   <div class="sub">Telegram bot — Users deposit karte hain, QR code automatically milta hai | <a href="?api_action=logout" style="color:var(--r)">Logout</a></div>
 
   <div class="info-box">
-    ✅ <b>Bot Flow: User /Deposit → Amount enter karo → Amount enter karo → QR code + UPI ID automatically aata hai → User pay karta hai → UTR/screenshot bhejta hai → Admin ko notification
+    ✅ <b>Bot Flow: User /Deposit → Enter amount → QR code + bank details sent → User pays → Sends UTR/screenshot → Admin gets notification
   </div>
 
   <!-- Action Bar -->
@@ -1273,8 +1275,8 @@ async function testBank(){
     <details style="margin-top:10px"><summary style="cursor:pointer;color:var(--td);font-size:11px">Raw Debug</summary>
     <pre style="font-size:10px;overflow:auto;max-height:200px;color:var(--td)">${esc(JSON.stringify(r.debug,null,2))}</pre></details>`;
   } else {
-    toast('❌ Bank details nahi mili — RB login sahi hai?','error');
-    body.innerHTML=`<div style="color:var(--r)">❌ Bank details nahi mili<br><pre style="font-size:10px;margin-top:8px">${esc(JSON.stringify(r.debug||r,null,2))}</pre></div>`;
+    toast('❌ No bank details found — RB login sahi hai?','error');
+    body.innerHTML=`<div style="color:var(--r)">❌ No bank details found<br><pre style="font-size:10px;margin-top:8px">${esc(JSON.stringify(r.debug||r,null,2))}</pre></div>`;
     card.style.display='block';
   }
 }
@@ -1292,7 +1294,7 @@ async function doTestScreenshot(){
   const chat=g('ss-chat').value.trim();
   if(!url||!chat){toast('URL aur Chat ID dono chahiye','error');return;}
   const st=g('ss-status');const res=g('ss-result');
-  st.textContent='⏳ Screenshot le raha hai (30-40 sec lag sakte hain)...';
+  st.textContent='⏳ Taking screenshot (may take 30-40 sec)....';
   st.style.color='var(--y)';
   res.style.display='none';
   const r=await api('test_screenshot',{url,chat_id:chat});
