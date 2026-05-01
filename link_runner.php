@@ -211,21 +211,18 @@ function lrGetScreenshotUrl($targetUrl) {
     ];
 }
 
-function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
-    if (!$token || !$chatId) return false;
-
-    // Download bytes from thum.io using a Telegram-bot-like user-agent
-    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/allowJPG/noanimate/' . $url;
+function lrFetchScreenshotBytes($targetUrl, $timeout = 30) {
+    // 1. thum.io
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL            => $thumbUrl,
+        CURLOPT_URL            => 'https://image.thum.io/get/width/1280/crop/900/allowJPG/noanimate/' . $targetUrl,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT        => $timeout,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS      => 5,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT      => 'TelegramBot (https://core.telegram.org/bots, 1.0)',
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
     ]);
     $bytes = curl_exec($ch);
     $code  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -233,15 +230,62 @@ function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
     $err   = curl_error($ch);
     curl_close($ch);
     lrLog("SS-DEBUG thum.io → HTTP {$code}, CT: {$ct}, bytes: " . strlen((string)$bytes) . ($err ? ", err: {$err}" : ''), 'info');
-
-    if ($code !== 200 || !$bytes || !str_contains((string)$ct, 'image')) {
-        lrLog('SS-DEBUG thum.io fetch failed', 'error');
-        return false;
+    if ($code === 200 && $bytes && str_contains((string)$ct, 'image')) {
+        return ['bytes' => $bytes, 'ext' => 'jpg'];
     }
 
-    // Save to temp file and upload as multipart to Telegram
-    $ssFile = LR_SS_DIR . 'ss_' . md5($url . microtime()) . '.jpg';
-    file_put_contents($ssFile, $bytes);
+    // 2. Microlink
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => 'https://api.microlink.io/?url=' . urlencode($targetUrl) . '&screenshot=true&meta=false',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; LinkRunner/1.1)',
+    ]);
+    $raw   = curl_exec($ch);
+    $mlErr = curl_error($ch);
+    curl_close($ch);
+    $mlData = json_decode($raw, true);
+    $ssUrl  = $mlData['data']['screenshot']['url'] ?? null;
+    lrLog("SS-DEBUG microlink → ssUrl: " . ($ssUrl ?: 'none') . ($mlErr ? ", err: {$mlErr}" : ''), 'info');
+    if ($ssUrl) {
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $ssUrl,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+        ]);
+        $imgBytes = curl_exec($ch);
+        $imgCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $imgErr   = curl_error($ch);
+        curl_close($ch);
+        lrLog("SS-DEBUG microlink img → HTTP {$imgCode}, bytes: " . strlen((string)$imgBytes) . ($imgErr ? ", err: {$imgErr}" : ''), 'info');
+        if ($imgCode === 200 && $imgBytes) {
+            return ['bytes' => $imgBytes, 'ext' => 'png'];
+        }
+    }
+
+    lrLog('SS-DEBUG all APIs failed', 'error');
+    return null;
+}
+
+function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
+    if (!$token || !$chatId) return false;
+
+    $result = lrFetchScreenshotBytes($url, $timeout);
+    if (!$result) return false;
+
+    $ext    = $result['ext'] ?? 'jpg';
+    $mime   = $ext === 'png' ? 'image/png' : 'image/jpeg';
+    $ssFile = LR_SS_DIR . 'ss_' . md5($url . microtime()) . '.' . $ext;
+    file_put_contents($ssFile, $result['bytes']);
 
     if (!file_exists($ssFile) || filesize($ssFile) < 500) {
         @unlink($ssFile);
@@ -261,7 +305,7 @@ function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
             'chat_id'    => $chatId,
             'caption'    => $caption,
             'parse_mode' => 'HTML',
-            'photo'      => new CURLFile($ssFile, 'image/jpeg', 'screenshot.jpg'),
+            'photo'      => new CURLFile($ssFile, $mime, 'screenshot.' . $ext),
         ],
     ]);
     $rawR = curl_exec($ch);
