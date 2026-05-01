@@ -195,6 +195,82 @@ function lrReplace($text, $vars) {
     return $text;
 }
 
+// ─── Auto-detect form fields from HTML page ─────────────────────────
+function lrDetectFormFields($pageUrl, $timeout = 20) {
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $pageUrl,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+        CURLOPT_HTTPHEADER     => ['Accept-Language: en-US,en;q=0.9'],
+    ]);
+    $html = curl_exec($ch);
+    curl_close($ch);
+    if (!$html) return [];
+
+    $fields = [];
+    $skip   = ['hidden', 'submit', 'button', 'reset', 'image', 'file', 'checkbox', 'radio'];
+
+    // Parse <input> tags
+    preg_match_all('/<input([^>]*)>/i', $html, $inputs);
+    foreach ($inputs[1] as $attrs) {
+        $type  = '';
+        $name  = '';
+        $ph    = '';
+        $label = '';
+        if (preg_match('/type\s*=\s*["\']?([a-zA-Z]+)/i', $attrs, $m)) $type = strtolower($m[1]);
+        if (in_array($type, $skip)) continue;
+        if (preg_match('/name\s*=\s*["\']([^"\']+)/i', $attrs, $m))        $name  = $m[1];
+        if (preg_match('/placeholder\s*=\s*["\']([^"\']+)/i', $attrs, $m)) $ph    = $m[1];
+        if (preg_match('/aria-label\s*=\s*["\']([^"\']+)/i', $attrs, $m))  $label = $m[1];
+        $display = $ph ?: $label ?: $name;
+        if ($display) $fields[$name ?: $display] = $display;
+    }
+
+    // Parse <textarea> tags
+    preg_match_all('/<textarea([^>]*)>/i', $html, $textareas);
+    foreach ($textareas[1] as $attrs) {
+        $name  = '';
+        $ph    = '';
+        $label = '';
+        if (preg_match('/name\s*=\s*["\']([^"\']+)/i', $attrs, $m))        $name  = $m[1];
+        if (preg_match('/placeholder\s*=\s*["\']([^"\']+)/i', $attrs, $m)) $ph    = $m[1];
+        if (preg_match('/aria-label\s*=\s*["\']([^"\']+)/i', $attrs, $m))  $label = $m[1];
+        $display = $ph ?: $label ?: $name;
+        if ($display) $fields[$name ?: $display] = $display;
+    }
+
+    // Parse <select> tags
+    preg_match_all('/<select([^>]*)>/i', $html, $selects);
+    foreach ($selects[1] as $attrs) {
+        $name  = '';
+        $label = '';
+        if (preg_match('/name\s*=\s*["\']([^"\']+)/i', $attrs, $m))       $name  = $m[1];
+        if (preg_match('/aria-label\s*=\s*["\']([^"\']+)/i', $attrs, $m)) $label = $m[1];
+        $display = $label ?: $name;
+        if ($display) $fields[$name ?: $display] = $display;
+    }
+
+    // Associate <label> text with nearby fields
+    preg_match_all('/<label[^>]*for\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)<\/label>/is', $html, $labels);
+    foreach ($labels[1] as $i => $forId) {
+        $labelText = trim(strip_tags($labels[2][$i]));
+        if (!$labelText) continue;
+        // Replace field key if we find it by id
+        preg_match_all('/<input[^>]*id\s*=\s*["\']' . preg_quote($forId, '/') . '["\'][^>]*name\s*=\s*["\']([^"\']+)/i', $html, $nm);
+        if (!empty($nm[1][0])) {
+            $fields[$nm[1][0]] = $labelText;
+        }
+    }
+
+    return $fields;
+}
+
 // ─── Form-fill session helpers ──────────────────────────────────────
 function lrSessionLoad() {
     if (!file_exists(LR_SESSION_FILE)) return [];
@@ -511,10 +587,12 @@ if (isset($_GET['webhook'])) {
 
         // More fields to ask?
         if ($session['step'] < count($session['fields'])) {
-            $nextField = $session['fields'][$session['step']];
+            $nextLabel = $session['field_labels'][$session['step']] ?? $session['fields'][$session['step']];
+            $total     = count($session['fields']);
+            $current   = $session['step'] + 1;
             lrTg('sendMessage', [
                 'chat_id'    => $chatId,
-                'text'       => "✏️ <b>" . htmlspecialchars($nextField, ENT_QUOTES) . "</b> dalo:\n<i>(ya /cancel likho)</i>",
+                'text'       => "✏️ <b>" . htmlspecialchars($nextLabel, ENT_QUOTES) . "</b> dalo: <i>({$current}/{$total})</i>\n<i>(ya /cancel likho)</i>",
                 'parse_mode' => 'HTML',
             ], $wToken);
             http_response_code(200); exit;
@@ -597,24 +675,54 @@ if (isset($_GET['webhook'])) {
             http_response_code(200); exit;
         }
 
-        // Parse fields
-        $fields = array_values(array_filter(array_map('trim', explode(',', $found['form_fields'] ?? '')), fn($f) => $f !== ''));
-        if (empty($fields)) {
-            lrTg('sendMessage', ['chat_id' => $chatId, 'text' => '⚠️ Is link ke liye form fields configure nahi hain.', 'parse_mode' => 'HTML'], $wToken);
-            http_response_code(200); exit;
+        // Parse fields — manual config ya auto-detect
+        $manualFields = array_values(array_filter(array_map('trim', explode(',', $found['form_fields'] ?? '')), fn($f) => $f !== ''));
+
+        if (!empty($manualFields)) {
+            // Manual fields configured — use them directly
+            // fields array: [name => display_label] ya flat [display_label]
+            $fieldMap = [];
+            foreach ($manualFields as $f) {
+                $fieldMap[$f] = $f;
+            }
+        } else {
+            // Auto-detect from site HTML
+            lrTg('sendMessage', [
+                'chat_id'    => $chatId,
+                'text'       => '🔍 Site ke form fields detect ho rahe hain...',
+                'parse_mode' => 'HTML',
+            ], $wToken);
+
+            $pageUrl  = lrReplace(trim($found['url'] ?? ''), ['ts' => date('Y-m-d H:i:s'), 'date' => date('Y-m-d'), 'time' => date('H:i:s')]);
+            $fieldMap = lrDetectFormFields($pageUrl, 20);
+
+            if (empty($fieldMap)) {
+                lrTg('sendMessage', [
+                    'chat_id'    => $chatId,
+                    'text'       => "⚠️ Site pe koi form field auto-detect nahi hua.\n\nAdmin panel mein <b>Form Fields</b> manually likho (comma se alag karo).",
+                    'parse_mode' => 'HTML',
+                ], $wToken);
+                http_response_code(200); exit;
+            }
         }
 
-        // Start session
+        // fieldMap: [field_name => display_label]
+        $fieldNames    = array_keys($fieldMap);
+        $fieldLabels   = array_values($fieldMap);
+
+        // Start session — store both name (for POST key) and label (for asking user)
         lrSessionSet($chatId, [
-            'link_id' => $found['id'],
-            'fields'  => $fields,
-            'step'    => 0,
-            'answers' => [],
+            'link_id'      => $found['id'],
+            'fields'       => $fieldNames,   // POST keys
+            'field_labels' => $fieldLabels,  // Human-readable labels to show user
+            'step'         => 0,
+            'answers'      => [],
         ]);
 
+        $firstLabel = $fieldLabels[0];
         lrTg('sendMessage', [
             'chat_id'    => $chatId,
-            'text'       => "📝 <b>" . htmlspecialchars($found['name']) . "</b> form shuru ho raha hai.\n\n✏️ <b>" . htmlspecialchars($fields[0]) . "</b> dalo:\n<i>(ya /cancel likho)</i>",
+            'text'       => "📝 <b>" . htmlspecialchars($found['name']) . "</b> form shuru!\n\n✏️ <b>" . htmlspecialchars($firstLabel) . "</b> dalo:\n<i>(ya /cancel likho)</i>",
             'parse_mode' => 'HTML',
         ], $wToken);
         http_response_code(200); exit;
@@ -1115,13 +1223,14 @@ function buildLinkEl(lk,i){
       <div class="f1">
         <label>📋 Form Fields (comma separated)</label>
         <input type="text" id="lff_${lk.id}" value="${esc(lk.form_fields||'')}" placeholder="username, password, email" onchange="syncField('${lk.id}','form_fields',this.value)">
-        <small style="color:var(--tf)">Bot user se ek ek karke ye fields puchega. URL/Body mein {username} jaise use karo.</small>
+        <small style="color:var(--tf)">Khali chhodo = site se auto-detect hoga. Ya manually likho: <code>username, password, email</code></small>
       </div>
     </div>
     <div style="background:rgba(99,179,237,.06);border:1px solid rgba(99,179,237,.2);border-radius:6px;padding:8px 12px;margin-top:4px;font-size:11px;color:var(--tf)">
-      📌 Bot pe <b>/fill ${esc(lk.name||'link name')}</b> command bhejo → bot har field puchega → reply karo → form submit ho jayega.<br>
+      📌 Bot pe <b>/fill ${esc(lk.name||'link name')}</b> command bhejo → site ke forms auto-detect honge → bot har field puchega → reply karo → submit.<br>
       URL example: <code>https://site.com/login?user={username}&pass={password}</code><br>
-      Body example: <code>username={username}&password={password}</code>
+      Body example: <code>username={username}&password={password}</code><br>
+      ✨ <b>Fields khali chhodo</b> = bot site se khud detect karega kya puchna hai.
     </div>
   </div>
 
