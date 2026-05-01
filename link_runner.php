@@ -214,8 +214,8 @@ function lrGetScreenshotUrl($targetUrl) {
 function lrTakeScreenshot($url, $token, $chatId, $caption, $timeout = 30) {
     if (!$token || !$chatId) return false;
 
-    // noanimate/ forces a static PNG (no animated GIF stream); URL appended raw per thum.io docs
-    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/png/noanimate/' . $url;
+    // allowJPG/noanimate/ forces static JPG output (no animated GIF); Telegram requires static image
+    $thumbUrl = 'https://image.thum.io/get/width/1280/crop/900/allowJPG/noanimate/' . $url;
     $r = lrTg('sendPhoto', [
         'chat_id'    => $chatId,
         'photo'      => $thumbUrl,
