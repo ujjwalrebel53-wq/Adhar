@@ -32,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 
-from uidai_browser import UIDaiSession
+from uidai_api import UIDaiSession
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -232,21 +232,31 @@ async def otp_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data.clear()
         return ConversationHandler.END
 
-    file_path = result["file_path"]
     await status_msg.edit_text(OTP_LOADING_STEPS[-1], parse_mode=ParseMode.HTML)
     await asyncio.sleep(0.5)
 
-    # Send the PDF
-    await update.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
-    with open(file_path, "rb") as f:
-        await update.message.reply_document(
-            document=InputFile(f, filename=os.path.basename(file_path)),
-            caption=(
-                "✅ <b>Aadhaar document ready!</b>\n"
-                "🔒 <i>Yeh file sirf aapke liye hai. Safely store karo.</i>"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+    file_path = result.get("file_path")
+
+    if file_path and os.path.exists(file_path):
+        # Send the PDF
+        await update.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
+        with open(file_path, "rb") as f:
+            await update.message.reply_document(
+                document=InputFile(f, filename=os.path.basename(file_path)),
+                caption=(
+                    "✅ <b>Aadhaar document ready!</b>\n"
+                    "🔒 <i>Yeh file sirf aapke liye hai. Safely store karo.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+    else:
+        # UIDAI sends UID via SMS — no direct PDF download
+        msg = result.get("message", "UID/EID aapke registered mobile pe SMS mein bhej diya gaya.")
+        uid = result.get("uid", "")
+        text = f"✅ <b>OTP verified!</b>\n\n📱 {msg}"
+        if uid:
+            text += f"\n\n🪪 UID: <code>{uid}</code>"
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     await status_msg.delete()
 
