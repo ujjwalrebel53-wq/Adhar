@@ -48,6 +48,13 @@ define('MIN_DEPOSIT',     500);
 // _id will be auto-resolved on first login and cached
 define('RB_DEPOSIT_CLIENT', 'Ujjwal0999');
 
+// ── RATE LIMIT CONFIG ────────────────────────────────────────
+// Agar user deposit shuru kare aur screenshot upload na kare
+// to 30 min ke liye block ho jayega
+define('RBB_RATE_FILE',       __DIR__ . '/rbb_ratelimit.json');
+define('RBB_BLOCK_MINUTES',   30);   // block duration in minutes
+define('RBB_MAX_INCOMPLETE',  2);    // kitni baar incomplete deposit allow hai
+
 if (!is_dir(RBB_COOKIE_DIR)) @mkdir(RBB_COOKIE_DIR, 0755, true);
 if (!is_dir(RBB_QR_DIR))     @mkdir(RBB_QR_DIR, 0755, true);
 
@@ -102,6 +109,64 @@ function rbbClearState($chatId) {
     $states = rbbGetStates();
     unset($states[(string)$chatId]);
     file_put_contents(RBB_STATE_FILE, json_encode($states, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+// ─── Rate Limiter ────────────────────────────────────────────
+function rlLoad() {
+    if (!file_exists(RBB_RATE_FILE)) return [];
+    return json_decode(file_get_contents(RBB_RATE_FILE), true) ?: [];
+}
+function rlSave($data) {
+    file_put_contents(RBB_RATE_FILE, json_encode($data, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+// Check if user is currently blocked
+function rlIsBlocked($chatId) {
+    $rl  = rlLoad();
+    $rec = $rl[(string)$chatId] ?? null;
+    if (!$rec) return false;
+    if (!empty($rec['blocked_until']) && time() < $rec['blocked_until']) {
+        return $rec['blocked_until']; // returns timestamp
+    }
+    return false;
+}
+
+// Record that user started a deposit (incomplete)
+function rlStartDeposit($chatId) {
+    $rl  = rlLoad();
+    $key = (string)$chatId;
+    if (!isset($rl[$key])) $rl[$key] = ['incomplete' => 0, 'blocked_until' => 0, 'last_start' => 0];
+    $rl[$key]['incomplete']++;
+    $rl[$key]['last_start'] = time();
+
+    // If too many incomplete — block for 30 min
+    if ($rl[$key]['incomplete'] >= RBB_MAX_INCOMPLETE) {
+        $rl[$key]['blocked_until'] = time() + (RBB_BLOCK_MINUTES * 60);
+        $rl[$key]['incomplete']    = 0; // reset counter after block
+        rlSave($rl);
+        return false; // blocked
+    }
+
+    rlSave($rl);
+    return true; // allowed
+}
+
+// User completed deposit (screenshot verified) — reset their record
+function rlCompleted($chatId) {
+    $rl  = rlLoad();
+    $key = (string)$chatId;
+    if (isset($rl[$key])) {
+        $rl[$key]['incomplete']    = 0;
+        $rl[$key]['blocked_until'] = 0;
+    }
+    rlSave($rl);
+}
+
+// Remaining block time as human string
+function rlRemainingTime($blockedUntil) {
+    $secs = max(0, $blockedUntil - time());
+    $mins = ceil($secs / 60);
+    return $mins . ' minute' . ($mins == 1 ? '' : 's');
 }
 
 // ─── Logging ─────────────────────────────────────────────────
@@ -418,6 +483,20 @@ function rbbGenerateQR($upiString, $outputFile) {
 
 // ─── Handle /Deposit command — seedha amount poochta hai ─────
 function handleDeposit($token, $chatId, $userName, $cfg) {
+    // ── Rate limit check ──────────────────────────────────────
+    $blockedUntil = rlIsBlocked($chatId);
+    if ($blockedUntil) {
+        $remaining = rlRemainingTime($blockedUntil);
+        tgSend($token, $chatId,
+            "🚫 <b>Temporarily Restricted</b>\n\n"
+          . "You started a deposit but did not complete it (no screenshot uploaded).\n\n"
+          . "⏳ Please wait <b>{$remaining}</b> before trying again.\n\n"
+          . "<i>Complete your deposit by sending a payment screenshot next time.</i>"
+        );
+        rbbLog("Rate limited — chat={$chatId} blocked for {$remaining}", 'error');
+        return;
+    }
+
     $minDep = (int)($cfg['min_deposit'] ?? MIN_DEPOSIT);
     $maxDep = (int)($cfg['max_deposit'] ?? 100000);
 
@@ -711,6 +790,9 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
         'pay_url' => $payPageUrl,
     ]);
 
+    // Record as incomplete deposit — user must upload screenshot
+    rlStartDeposit($chatId);
+
     // Notify admin
     $adminChatId = trim($cfg['admin_chat_id'] ?? '');
     if ($adminChatId) {
@@ -858,6 +940,7 @@ function handleScreenshotUtr($token, $chatId, $msg, $state, $cfg) {
     );
 
     rbbClearState($chatId);
+    rlCompleted($chatId); // remove rate limit restriction
 
     // Notify admin with screenshot forwarded
     $adminChatId = trim($cfg['admin_chat_id'] ?? '');
@@ -1156,6 +1239,27 @@ if (isset($_GET['api_action'])) {
             $r = tgSend($tok, $cid, "✅ <b>Rebel B2W</b> is working!\n\n" . date('d/m/Y H:i:s'));
             echo json_encode(['ok' => $r['ok'] ?? false]); exit;
 
+        case 'get_blocked_users':
+            $rl = rlLoad();
+            $now = time();
+            $blocked = [];
+            foreach ($rl as $cid => $rec) {
+                if (!empty($rec['blocked_until']) && $rec['blocked_until'] > $now) {
+                    $blocked[$cid] = [
+                        'blocked_until'  => $rec['blocked_until'],
+                        'remaining_mins' => ceil(($rec['blocked_until'] - $now) / 60),
+                        'incomplete'     => $rec['incomplete'] ?? 0,
+                    ];
+                }
+            }
+            echo json_encode(['ok' => true, 'blocked' => $blocked, 'total' => count($blocked)]); exit;
+
+        case 'unblock_user':
+            $cid = trim($body['chat_id'] ?? '');
+            if (!$cid) { echo json_encode(['ok' => false, 'error' => 'chat_id required']); exit; }
+            rlCompleted($cid);
+            echo json_encode(['ok' => true, 'msg' => "User {$cid} unblocked"]); exit;
+
         case 'get_deposit_logs':
             // Return last 50 deposit states/transactions from log
             $logs = file_exists(RBB_LOG_FILE) ? (json_decode(file_get_contents(RBB_LOG_FILE), true) ?: []) : [];
@@ -1270,6 +1374,7 @@ document.getElementById('lpass').focus();
     <button class="btn bg" onclick="sendTest()">📨 Test Message</button>
     <button class="btn brb" onclick="testScreenshot()">📸 Test Screenshot</button>
     <button class="btn bgr" onclick="loadUsers()">📋 Deposit Logs</button>
+    <button class="btn br" onclick="loadBlocked()">🚫 Blocked Users</button>
     <button class="btn bgr" onclick="loadLogs()">📋 All Logs</button>
   </div>
 
@@ -1434,6 +1539,33 @@ async function testBank(){
     toast('❌ Bank details not found','error');
     body.innerHTML=`<div style="color:var(--r)">❌ fetchAvailablePeer failed<br><pre style="font-size:10px;margin-top:8px;color:var(--td)">${esc(JSON.stringify(r,null,2))}</pre></div>`;
   }
+}
+
+async function loadBlocked(){
+  const r=await api('get_blocked_users');
+  const card=g('users-card');
+  const body=g('users-body');
+  card.style.display='block';
+  if(!r.ok||!Object.keys(r.blocked||{}).length){
+    body.innerHTML='<div style="color:var(--g)">✅ No blocked users right now.</div>';
+    return;
+  }
+  let rows='';
+  Object.entries(r.blocked).forEach(([cid,info])=>{
+    rows+=`<tr>
+      <td class="mono">${esc(cid)}</td>
+      <td style="color:var(--r)">${info.remaining_mins} min remaining</td>
+      <td><button class="btn bg bsm" onclick="unblockUser('${esc(cid)}')">✅ Unblock</button></td>
+    </tr>`;
+  });
+  body.innerHTML=`<div style="margin-bottom:8px;color:var(--r)">🚫 <b>Blocked Users: ${r.total}</b></div>`
+    +`<table class="user-table"><thead><tr><th>Chat ID</th><th>Block Time Left</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function unblockUser(chatId){
+  const r=await api('unblock_user',{chat_id:chatId});
+  r.ok ? toast('✅ User unblocked: '+chatId,'success') : toast('Error: '+(r.error||''),'error');
+  loadBlocked();
 }
 
 async function testScreenshot(){
