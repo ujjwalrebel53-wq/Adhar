@@ -249,13 +249,35 @@ function rbAdminLogin($cfg) {
     return $d['user'] ?? $d['data'] ?? ((!empty($d['success'])) ? $d : false);
 }
 
-// ─── Get bank details (UPI ID, account) ──────────────────────
+// ─── Get ALL active bank details (real-time) ─────────────────
+// Returns full bank object: upiId, accNo, ifscCode, bankName, accHolderName
 function rbGetBankDetails($cfg) {
     $bankId = trim($cfg['rb_bank_id'] ?? '69ca38e87f96dde534afef82');
-    $res    = rbApi("/bank/getActiveBankDetails/{$bankId}");
-    if (!$res['ok']) return null;
-    $d = $res['data'];
-    return $d['data'] ?? $d;
+
+    // Method 1: getActiveBankDetails by bank ID
+    $res = rbApi("/bank/getActiveBankDetails/{$bankId}");
+    if ($res['ok'] && !empty($res['data'])) {
+        $d = $res['data'];
+        $bank = $d['data'] ?? $d;
+        if (is_array($bank) && (isset($bank['upiId']) || isset($bank['accNo']))) {
+            return $bank;
+        }
+    }
+
+    // Method 2: getSavedBanks (admin ke saved banks)
+    $res2 = rbApi('/user/getSavedBanks');
+    if ($res2['ok'] && !empty($res2['data'])) {
+        $banks = $res2['data']['data'] ?? $res2['data'];
+        if (is_array($banks) && count($banks) > 0) {
+            // First active bank
+            foreach ($banks as $b) {
+                if (!empty($b['isActive'])) return $b;
+            }
+            return $banks[0];
+        }
+    }
+
+    return null;
 }
 
 // ─── Create deposit transaction ───────────────────────────────
@@ -353,113 +375,104 @@ function handleDeposit($token, $chatId, $userName, $cfg) {
     rbbSetState($chatId, 'awaiting_amount', []);
 }
 
-// ─── Fetch real QR screenshot from RockyBook / PowerDreams ──
-// RockyBook site pe Deposit button dabane pe jo real QR aata hai
-// wahi screenshot fetch karta hai via:
-// 1) /transaction/fetch_powerPay_transaction_screenshot/{txnId}  ← rockybook API
-// 2) thum.io screenshot of https://www.powerdreams.co/online/pay/{branch}/{txnId}
-function rbFetchRealQR($txnId, $branch, $outputFile, $timeout = 30) {
-    // Method 1: RockyBook ka built-in screenshot API (real QR jo site pe dikhta hai)
-    $res = rbApi("/transaction/fetch_powerPay_transaction_screenshot/{$txnId}");
-    if ($res['ok'] && !empty($res['data'])) {
-        $d = $res['data'];
-        // Could be base64 image or URL
-        $imgData = $d['screenshot'] ?? $d['image'] ?? $d['data'] ?? $d['url'] ?? null;
-        if ($imgData) {
-            if (str_starts_with($imgData, 'data:image')) {
-                // base64
-                $b64 = preg_replace('/^data:image\/\w+;base64,/', '', $imgData);
-                $bytes = base64_decode($b64);
-                if ($bytes && strlen($bytes) > 500) {
-                    file_put_contents($outputFile, $bytes);
-                    return ['ok' => true, 'source' => 'rockybook-api'];
-                }
-            } elseif (str_starts_with($imgData, 'http')) {
-                // URL — fetch it
-                $ch = curl_init();
-                curl_setopt_array($ch, [
-                    CURLOPT_URL            => $imgData,
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_TIMEOUT        => 20,
-                    CURLOPT_SSL_VERIFYPEER => false,
-                    CURLOPT_FOLLOWLOCATION => true,
-                ]);
-                $bytes = curl_exec($ch);
-                curl_close($ch);
-                if ($bytes && strlen($bytes) > 500) {
-                    file_put_contents($outputFile, $bytes);
-                    return ['ok' => true, 'source' => 'rockybook-api-url'];
-                }
-            } elseif (strlen($imgData) > 500) {
-                // raw bytes
-                file_put_contents($outputFile, $imgData);
-                return ['ok' => true, 'source' => 'rockybook-api-raw'];
-            }
-        }
-    }
-
-    // Method 2: thum.io screenshot of real PowerDreams payment page
-    // This is the EXACT page users see when they click Deposit on the site
-    $payUrl  = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
-    $thumbUrl = 'https://image.thum.io/get/width/720/crop/1280/png/' . urlencode($payUrl);
-
+// ─── Fetch URL as image bytes ─────────────────────────────────
+function rbFetchImage($url, $timeout = 25) {
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL            => $thumbUrl,
+        CURLOPT_URL            => $url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT        => $timeout,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS      => 5,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
     ]);
     $data = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $ct   = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
     curl_close($ch);
+    if ($code === 200 && $data && strlen($data) > 500) return $data;
+    return null;
+}
 
-    if ($code === 200 && $data && strlen($data) > 500 && str_contains((string)$ct, 'image')) {
+// ─── Take screenshot of a URL ─────────────────────────────────
+// Tries thum.io → microlink → screenshotone
+function rbScreenshotUrl($url, $outputFile, $timeout = 35) {
+    $enc = urlencode($url);
+
+    // 1. thum.io (fastest, no key, returns PNG directly)
+    $data = rbFetchImage("https://image.thum.io/get/width/800/crop/1200/png/{$enc}", $timeout);
+    if ($data && strlen($data) > 500) {
         file_put_contents($outputFile, $data);
-        return ['ok' => true, 'source' => 'powerdreams-screenshot'];
+        return 'thum.io';
     }
 
-    // Method 3: microlink screenshot
-    $mlUrl = 'https://api.microlink.io/?url=' . urlencode($payUrl) . '&screenshot=true&meta=false&embed=screenshot.url&timeout=15000';
+    // 2. microlink (returns JSON with screenshot URL)
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL            => $mlUrl,
+        CURLOPT_URL            => "https://api.microlink.io/?url={$enc}&screenshot=true&meta=false&embed=screenshot.url&timeout=20000",
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 25,
+        CURLOPT_TIMEOUT        => 30,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_FOLLOWLOCATION => true,
     ]);
     $raw = curl_exec($ch);
     curl_close($ch);
-    $mlData = json_decode($raw, true);
-    $ssUrl  = $mlData['data']['screenshot']['url'] ?? null;
-    if ($ssUrl) {
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL            => $ssUrl,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 20,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_FOLLOWLOCATION => true,
-        ]);
-        $bytes = curl_exec($ch);
-        $imgCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        if ($imgCode === 200 && $bytes && strlen($bytes) > 500) {
-            file_put_contents($outputFile, $bytes);
-            return ['ok' => true, 'source' => 'microlink'];
+    $ml  = json_decode($raw, true);
+    $ssUrl = $ml['data']['screenshot']['url'] ?? $ml['data']['screenshot'] ?? null;
+    if ($ssUrl && str_starts_with($ssUrl, 'http')) {
+        $data = rbFetchImage($ssUrl, 20);
+        if ($data && strlen($data) > 500) {
+            file_put_contents($outputFile, $data);
+            return 'microlink';
         }
     }
 
-    return ['ok' => false, 'source' => null];
+    // 3. screenshotone (no key, free tier)
+    $data = rbFetchImage("https://api.screenshotone.com/take?url={$enc}&viewport_width=800&viewport_height=1200&format=png&timeout=20", 25);
+    if ($data && strlen($data) > 500) {
+        file_put_contents($outputFile, $data);
+        return 'screenshotone';
+    }
+
+    return null;
 }
 
-// ─── Process deposit amount → create txn → send REAL QR ──────
+// ─── Fetch real QR/screenshot from RockyBook payment page ────
+function rbFetchRealQR($txnId, $branch, $outputFile, $timeout = 35) {
+    // Method 1: RockyBook built-in screenshot API
+    $res = rbApi("/transaction/fetch_powerPay_transaction_screenshot/{$txnId}");
+    if ($res['ok'] && !empty($res['data'])) {
+        $d = $res['data'];
+        $imgData = $d['screenshot'] ?? $d['image'] ?? $d['data'] ?? $d['url'] ?? $d['screenshotUrl'] ?? null;
+        if ($imgData) {
+            if (str_starts_with($imgData, 'data:image')) {
+                $bytes = base64_decode(preg_replace('/^data:image\/\w+;base64,/', '', $imgData));
+                if ($bytes && strlen($bytes) > 500) {
+                    file_put_contents($outputFile, $bytes);
+                    return 'rockybook-api';
+                }
+            } elseif (str_starts_with($imgData, 'http')) {
+                $bytes = rbFetchImage($imgData, 20);
+                if ($bytes && strlen($bytes) > 500) {
+                    file_put_contents($outputFile, $bytes);
+                    return 'rockybook-api-url';
+                }
+            }
+        }
+    }
+
+    // Method 2: Screenshot of actual PowerDreams payment page
+    // (exact page that opens when user clicks Deposit on site)
+    $payUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
+    $src = rbScreenshotUrl($payUrl, $outputFile, $timeout);
+    if ($src) return "payment-page-{$src}";
+
+    return null;
+}
+
+// ─── Process deposit amount → create txn → send REAL details ─
 function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
     $minDep = (int)($cfg['min_deposit'] ?? MIN_DEPOSIT);
     $maxDep = (int)($cfg['max_deposit'] ?? 100000);
@@ -483,93 +496,133 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
         return false;
     }
 
-    // Create transaction — same as clicking Deposit button on the site
     $rbUserId = $adminUser['_id'] ?? $adminUser['id'] ?? null;
     $branch   = trim($cfg['rb_branch'] ?? 'RBVIP1D');
 
-    $txn = rbCreateDeposit($cfg, $rbUserId, $amount);
-
-    $txnId   = $txn['_id'] ?? $txn['id'] ?? $txn['transactionId'] ?? null;
-    $mode    = $txn['mode'] ?? 'PowerPay';
-    $upiId   = $txn['upiId']   ?? $txn['upi']   ?? null;
-    $accName = $txn['accHolderName'] ?? $txn['holderName'] ?? null;
-    $bankNm  = $txn['bankName'] ?? null;
+    // Create transaction on RockyBook (same as clicking Deposit button on site)
+    $txn   = rbCreateDeposit($cfg, $rbUserId, $amount);
+    $txnId = $txn['_id'] ?? $txn['id'] ?? $txn['transactionId'] ?? null;
+    $mode  = $txn['mode'] ?? 'PowerPay';
 
     if (!$txnId) {
         tgSend($token, $chatId, "❌ Transaction create nahi ho saki. Thodi der baad try karo.");
-        rbbLog("Deposit failed: createTransaction returned no ID — chat={$chatId} amount={$amount}", 'error');
+        rbbLog("Deposit failed: no txnId — chat={$chatId} amount={$amount} txn=" . json_encode($txn), 'error');
         return false;
     }
 
-    // Real payment page URL (jo site pe redirect hoti hai)
-    $payPageUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
+    // ── Get REAL bank details from RockyBook ─────────────────
+    // Priority: from transaction response → then getSavedBanks → then getActiveBankDetails
+    $upiId   = $txn['upiId']        ?? $txn['upi']         ?? null;
+    $accNo   = $txn['accNo']        ?? $txn['accountNo']   ?? null;
+    $ifsc    = $txn['ifscCode']     ?? $txn['ifsc']        ?? null;
+    $bankNm  = $txn['bankName']     ?? null;
+    $accName = $txn['accHolderName']?? $txn['holderName']  ?? null;
 
-    tgSend($token, $chatId, "⏳ QR code generate ho raha hai...");
-
-    // Fetch real QR screenshot from the actual payment page
-    $qrFile = RBB_QR_DIR . 'qr_' . $chatId . '_' . time() . '.png';
-    // Wait 3 seconds for payment page to initialize
-    sleep(3);
-    $qrResult = rbFetchRealQR($txnId, $branch, $qrFile);
-
-    // Also try to get bank details for UPI ID if not in txn response
-    if (!$upiId) {
-        $bankDetails = rbGetBankDetails($cfg);
-        $upiId   = $bankDetails['upiId']  ?? $bankDetails['upi'] ?? null;
-        $accName = $accName ?? ($bankDetails['accHolderName'] ?? null);
-        $bankNm  = $bankNm  ?? ($bankDetails['bankName'] ?? null);
+    // If not in txn response, fetch from bank API
+    if (!$upiId && !$accNo) {
+        $bank  = rbGetBankDetails($cfg);
+        $upiId  = $upiId   ?? ($bank['upiId']         ?? $bank['upi']      ?? null);
+        $accNo  = $accNo   ?? ($bank['accNo']          ?? $bank['accountNo']?? null);
+        $ifsc   = $ifsc    ?? ($bank['ifscCode']       ?? $bank['ifsc']     ?? null);
+        $bankNm = $bankNm  ?? ($bank['bankName']       ?? null);
+        $accName= $accName ?? ($bank['accHolderName']  ?? $bank['holderName']?? null);
     }
 
+    // Real payment page URL (jo site pe redirect karti hai)
+    $payPageUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
+
+    // ── Build keyboard ────────────────────────────────────────
     $keyboard = [
         'inline_keyboard' => [[
             ['text' => '✅ Payment Ho Gayi — UTR Bhejo', 'callback_data' => 'submit_utr_' . $txnId],
         ]],
     ];
 
-    $caption = "🎯 <b>RockyBook Deposit</b>\n\n"
+    // ── Full bank details message (always send this) ──────────
+    $bankMsg = "🎯 <b>RockyBook Deposit Details</b>\n\n"
              . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
+             . "🔖 Txn ID: <code>{$txnId}</code>\n"
+             . "\n<b>💳 Bank / UPI Details:</b>\n"
              . ($upiId   ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
              . ($accName ? "👤 Name: <b>{$accName}</b>\n" : '')
+             . ($accNo   ? "🔢 Acc No: <code>{$accNo}</code>\n" : '')
+             . ($ifsc    ? "🏛 IFSC: <code>{$ifsc}</code>\n" : '')
              . ($bankNm  ? "🏦 Bank: {$bankNm}\n" : '')
-             . "🔖 Txn ID: <code>{$txnId}</code>\n"
-             . "\n<b>Steps:</b>\n"
-             . "1️⃣ QR scan karo ya UPI ID pe pay karo\n"
-             . "2️⃣ Exact amount bhejo: <b>₹" . number_format($amount) . "</b>\n"
-             . "3️⃣ Payment ke baad UTR / Screenshot yahan bhejo";
+             . "\n⚠️ <b>Sirf ₹" . number_format($amount) . " hi bhejo (exact amount)</b>\n\n"
+             . "Payment ke baad UTR number ya screenshot yahan bhejo 👇";
 
-    $photoSent = false;
+    // ── QR / Screenshot ───────────────────────────────────────
+    tgSend($token, $chatId, "⏳ QR code le raha hai...");
 
-    // Send real QR screenshot if we got it
-    if ($qrResult['ok'] && file_exists($qrFile) && filesize($qrFile) > 500) {
-        $r = tgSendPhoto($token, $chatId, $qrFile, $caption, $keyboard);
+    $qrFile = RBB_QR_DIR . 'qr_' . $chatId . '_' . time() . '.png';
+    sleep(3); // payment page initialize hone do
+
+    // Step 1: Try RockyBook screenshot API + payment page screenshot
+    $qrSource = rbFetchRealQR($txnId, $branch, $qrFile);
+
+    if ($qrSource && file_exists($qrFile) && filesize($qrFile) > 500) {
+        // Send screenshot with bank details caption
+        $caption = "📸 <b>Payment QR — RockyBook</b>\n\n"
+                 . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
+                 . ($upiId ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
+                 . "🔖 Txn ID: <code>{$txnId}</code>";
+        $r = tgSendPhoto($token, $chatId, $qrFile, $caption, null);
         @unlink($qrFile);
-        $photoSent = !empty($r['ok']);
+        if (!empty($r['ok'])) {
+            // Also send full bank details as separate message
+            tgSend($token, $chatId, $bankMsg, $keyboard);
+            rbbLog("Real QR screenshot sent — chat={$chatId} txn={$txnId} src={$qrSource}", 'success');
+            goto save_state;
+        }
     }
 
-    // Fallback: generate UPI QR if screenshot failed
-    if (!$photoSent) {
-        if ($upiId) {
-            $upiStr  = "upi://pay?pa={$upiId}&am={$amount}&cu=INR&tn=RockyBook";
-            $fallbackQr = RBB_QR_DIR . 'fallback_' . $chatId . '.png';
-            $qrOk = rbbGenerateQR($upiStr, $fallbackQr);
-            if ($qrOk && file_exists($fallbackQr) && filesize($fallbackQr) > 500) {
-                $r = tgSendPhoto($token, $chatId, $fallbackQr, $caption, $keyboard);
-                @unlink($fallbackQr);
-                $photoSent = !empty($r['ok']);
+    // Step 2: Generate UPI QR from UPI ID (if screenshot failed)
+    if ($upiId) {
+        $upiStr = "upi://pay?pa={$upiId}&am={$amount}&cu=INR&tn=RockyBook";
+        $upiQrFile = RBB_QR_DIR . 'upi_' . $chatId . '_' . time() . '.png';
+        $qrApis = [
+            "https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=" . urlencode($upiStr),
+            "https://quickchart.io/qr?size=512&text=" . urlencode($upiStr),
+            "https://chart.googleapis.com/chart?cht=qr&chs=512x512&chl=" . urlencode($upiStr),
+        ];
+        $upiQrSent = false;
+        foreach ($qrApis as $qrApi) {
+            $bytes = rbFetchImage($qrApi, 12);
+            if ($bytes && strlen($bytes) > 500) {
+                file_put_contents($upiQrFile, $bytes);
+                $caption = "📱 <b>UPI QR Code</b>\n\n"
+                         . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
+                         . "📱 UPI ID: <code>{$upiId}</code>\n"
+                         . "🔖 Txn ID: <code>{$txnId}</code>";
+                $r = tgSendPhoto($token, $chatId, $upiQrFile, $caption, null);
+                @unlink($upiQrFile);
+                if (!empty($r['ok'])) {
+                    $upiQrSent = true;
+                    tgSend($token, $chatId, $bankMsg, $keyboard);
+                    rbbLog("UPI QR sent — chat={$chatId} txn={$txnId}", 'success');
+                    break;
+                }
             }
         }
-        if (!$photoSent) {
-            $upiStr = $upiId ? "upi://pay?pa={$upiId}&am={$amount}&cu=INR" : '';
-            tgSend($token, $chatId, $caption . ($upiStr ? "\n\n🔗 UPI Pay Link:\n<code>{$upiStr}</code>" : ''), $keyboard);
+        if (!$upiQrSent) {
+            // Text only with UPI link
+            tgSend($token, $chatId, $bankMsg . "\n\n🔗 UPI Pay: <code>{$upiStr}</code>", $keyboard);
+            rbbLog("Text-only deposit sent — chat={$chatId} txn={$txnId}", 'info');
         }
+    } else {
+        // No UPI ID — just send bank details
+        tgSend($token, $chatId, $bankMsg, $keyboard);
+        rbbLog("Bank details sent (no UPI) — chat={$chatId} txn={$txnId}", 'info');
     }
 
-    // Save state
+    save_state:
+
+    // Save state for UTR submission
     rbbSetState($chatId, 'awaiting_utr', [
-        'amount'   => $amount,
-        'txn_id'   => $txnId,
-        'upi_id'   => $upiId,
-        'pay_url'  => $payPageUrl,
+        'amount'  => $amount,
+        'txn_id'  => $txnId,
+        'upi_id'  => $upiId,
+        'pay_url' => $payPageUrl,
     ]);
 
     // Notify admin
@@ -580,12 +633,12 @@ function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
           . "📊 TG: <code>{$chatId}</code>\n"
           . "💰 Amount: ₹" . number_format($amount) . "\n"
           . "🔖 Txn: <code>{$txnId}</code>\n"
+          . ($upiId ? "📱 UPI: <code>{$upiId}</code>\n" : '')
           . "🌐 Mode: {$mode}\n"
           . "🕐 " . date('d/m/Y H:i:s')
         );
     }
 
-    rbbLog("Deposit QR sent — chat={$chatId} amount={$amount} txn={$txnId} src=" . ($qrResult['source'] ?? 'fallback'), 'success');
     return true;
 }
 
