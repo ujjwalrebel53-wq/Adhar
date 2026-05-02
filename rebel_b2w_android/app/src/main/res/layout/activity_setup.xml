@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0e0e12"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="32dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="💰"
+        android:textSize="56sp"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Rebel B2W"
+        android:textColor="#FF6B1A"
+        android:textSize="28sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="4dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Admin Bot Control Panel"
+        android:textColor="#8888AA"
+        android:textSize="14sp"
+        android:layout_marginBottom="40dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="🌐 Server URL"
+        android:textColor="#8888AA"
+        android:textSize="12sp"
+        android:layout_marginBottom="6dp" />
+
+    <EditText
+        android:id="@+id/et_url"
+        android:layout_width="match_parent"
+        android:layout_height="56dp"
+        android:background="@drawable/input_bg"
+        android:hint="https://yourserver.com/rb_deposit_bot.php"
+        android:inputType="textUri"
+        android:padding="14dp"
+        android:textColor="#E8E8F0"
+        android:textColorHint="#555577"
+        android:textSize="13sp"
+        android:imeOptions="actionGo"
+        android:layout_marginBottom="12dp" />
+
+    <TextView
+        android:id="@+id/tv_error"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="#FF4466"
+        android:textSize="12sp"
+        android:visibility="gone"
+        android:layout_marginBottom="12dp" />
+
+    <Button
+        android:id="@+id/btn_go"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:background="@drawable/btn_primary"
+        android:text="🔓 Open Admin Panel"
+        android:textColor="#000000"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:stateListAnimator="@null" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Apne server pe rb_deposit_bot.php upload karein, phir uska URL yahan dalein."
+        android:textColor="#555577"
+        android:textSize="11sp"
+        android:gravity="center"
+        android:layout_marginTop="24dp" />
+
+</LinearLayout>

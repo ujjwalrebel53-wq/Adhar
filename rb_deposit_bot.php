@@ -1,0 +1,1828 @@
+<?php
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║          REBEL ROCKYBOOK DEPOSIT BOT                            ║
+ * ║  Telegram bot — users /Deposit karke amount dalte hain,         ║
+ * ║  RockyBook pe transaction create hoti hai, UPI QR code          ║
+ * ║  automatically Telegram pe aa jaata hai.                        ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * Setup:
+ *   1. Is file ko apne server pe upload karo
+ *   2. Browser mein kholo → admin panel
+ *   3. Bot Token, RockyBook credentials set karo
+ *   4. "Set Webhook" dabao
+ *   5. Users ko bot link bhejo — ve /Deposit karke deposit kar sakte hain
+ *
+ * Flow:
+ *   User: /Deposit
+ *   Bot: "Amount enter karo (min ₹500):"
+ *   User: 1000
+ *   Bot: [QR Code image + UPI details + transaction ID]
+ *   User: payment kare → UTR/screenshot submit kare
+ *   Bot: "Transaction submitted! Admin verify karega."
+ */
+
+// ─── compat shims ───────────────────────────────────────────
+if (!function_exists('str_starts_with')) {
+    function str_starts_with($h, $n) { return strncmp($h, $n, strlen($n)) === 0; }
+}
+if (!function_exists('str_contains')) {
+    function str_contains($h, $n) { return strpos($h, $n) !== false; }
+}
+
+// ────────────────────────────────────────────────────────────
+define('RBB_VERSION',     '1.0');
+define('RBB_CONFIG_FILE', __DIR__ . '/rbb_config.json');
+define('RBB_LOG_FILE',    __DIR__ . '/rbb_logs.json');
+define('RBB_STATE_FILE',  __DIR__ . '/rbb_states.json');
+define('RBB_COOKIE_DIR',  __DIR__ . '/rbb_cookies/');
+define('RBB_QR_DIR',      __DIR__ . '/rbb_qr/');
+define('RB_API_BASE',     'https://rockybook.vip/api');
+define('TG_BASE',         'https://api.telegram.org/bot');
+define('MIN_DEPOSIT',     500);
+
+// ── HARDCODED DEPOSIT USER ───────────────────────────────────
+// Har deposit is user (@Ujjwal0999) ke account pe jayegi
+// RockyBook clientName: Ujjwal0999
+// _id will be auto-resolved on first login and cached
+define('RB_DEPOSIT_CLIENT', 'Ujjwal0999');
+
+// ── RATE LIMIT CONFIG ────────────────────────────────────────
+// Agar user deposit shuru kare aur screenshot upload na kare
+// to 30 min ke liye block ho jayega
+define('RBB_RATE_FILE',       __DIR__ . '/rbb_ratelimit.json');
+define('RBB_BLOCK_MINUTES',   30);   // block duration in minutes
+define('RBB_MAX_INCOMPLETE',  2);    // kitni baar incomplete deposit allow hai
+
+// ── LEDGER (user balances) ────────────────────────────────────
+// Local ledger — admin approves deposits, balance credited here
+define('RBB_LEDGER_FILE',     __DIR__ . '/rbb_ledger.json');
+define('WITHDRAWAL_CONTACT',  '@Rebel_babyyy'); // Withdrawal support contact
+
+if (!is_dir(RBB_COOKIE_DIR)) @mkdir(RBB_COOKIE_DIR, 0755, true);
+if (!is_dir(RBB_QR_DIR))     @mkdir(RBB_QR_DIR, 0755, true);
+
+// ─── Default config ──────────────────────────────────────────
+$defaultConfig = [
+    'admin_pass'     => 'rebel@2026',
+    'bot_token'      => '',
+    'admin_chat_id'  => '',      // Admin ko notifications jaati hain
+    'rb_phone'       => 'god',         // RockyBook login username
+    'rb_password'    => '@Ujjwal0999',  // RockyBook account password
+    'rb_branch'      => 'RBVIP1D',  // Branch name used in transactions
+    'rb_bank_id'     => '', // Optional: specific bank ID (leave blank = auto-detect)
+    'min_deposit'    => 500,
+    'max_deposit'    => 100000,
+    'welcome_msg'    => "🎯 <b>Rebel B2W</b>\n\nWelcome! Use this bot to manage your deposits and withdrawals.\n\n💰 /Deposit — Make a deposit\n💸 /Withdrawal — Request a withdrawal\n💳 /Balance — Check your balance\n❓ /Help — Help",
+    'deposit_thanks' => "✅ <b>Transaction Submitted!</b>\n\nAdmin will verify shortly. Contact support if you need help.",
+];
+
+// ─── Load/Save config ────────────────────────────────────────
+function rbbLoadConfig() {
+    global $defaultConfig;
+    if (!file_exists(RBB_CONFIG_FILE)) return $defaultConfig;
+    $loaded = json_decode(file_get_contents(RBB_CONFIG_FILE), true);
+    if (!is_array($loaded)) return $defaultConfig;
+    return array_merge($defaultConfig, $loaded);
+}
+function rbbSaveConfig($cfg) {
+    file_put_contents(RBB_CONFIG_FILE, json_encode($cfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+// ─── User states (conversation state machine) ────────────────
+function rbbGetStates() {
+    if (!file_exists(RBB_STATE_FILE)) return [];
+    return json_decode(file_get_contents(RBB_STATE_FILE), true) ?: [];
+}
+function rbbSetState($chatId, $state, $data = []) {
+    $states = rbbGetStates();
+    $states[(string)$chatId] = ['state' => $state, 'data' => $data, 'ts' => time()];
+    file_put_contents(RBB_STATE_FILE, json_encode($states, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+function rbbGetState($chatId) {
+    $states = rbbGetStates();
+    $s = $states[(string)$chatId] ?? null;
+    // Expire states older than 30 minutes
+    if ($s && (time() - ($s['ts'] ?? 0)) > 1800) {
+        rbbClearState($chatId);
+        return null;
+    }
+    return $s;
+}
+function rbbClearState($chatId) {
+    $states = rbbGetStates();
+    unset($states[(string)$chatId]);
+    file_put_contents(RBB_STATE_FILE, json_encode($states, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+// ─── Rate Limiter ────────────────────────────────────────────
+function rlLoad() {
+    if (!file_exists(RBB_RATE_FILE)) return [];
+    return json_decode(file_get_contents(RBB_RATE_FILE), true) ?: [];
+}
+function rlSave($data) {
+    file_put_contents(RBB_RATE_FILE, json_encode($data, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+// Check if user is currently blocked
+function rlIsBlocked($chatId) {
+    $rl  = rlLoad();
+    $rec = $rl[(string)$chatId] ?? null;
+    if (!$rec) return false;
+    if (!empty($rec['blocked_until']) && time() < $rec['blocked_until']) {
+        return $rec['blocked_until']; // returns timestamp
+    }
+    return false;
+}
+
+// Record that user started a deposit (incomplete)
+function rlStartDeposit($chatId) {
+    $rl  = rlLoad();
+    $key = (string)$chatId;
+    if (!isset($rl[$key])) $rl[$key] = ['incomplete' => 0, 'blocked_until' => 0, 'last_start' => 0];
+    $rl[$key]['incomplete']++;
+    $rl[$key]['last_start'] = time();
+
+    // If too many incomplete — block for 30 min
+    if ($rl[$key]['incomplete'] >= RBB_MAX_INCOMPLETE) {
+        $rl[$key]['blocked_until'] = time() + (RBB_BLOCK_MINUTES * 60);
+        $rl[$key]['incomplete']    = 0; // reset counter after block
+        rlSave($rl);
+        return false; // blocked
+    }
+
+    rlSave($rl);
+    return true; // allowed
+}
+
+// User completed deposit (screenshot verified) — reset their record
+function rlCompleted($chatId) {
+    $rl  = rlLoad();
+    $key = (string)$chatId;
+    if (isset($rl[$key])) {
+        $rl[$key]['incomplete']    = 0;
+        $rl[$key]['blocked_until'] = 0;
+    }
+    rlSave($rl);
+}
+
+// Remaining block time as human string
+function rlRemainingTime($blockedUntil) {
+    $secs = max(0, $blockedUntil - time());
+    $mins = ceil($secs / 60);
+    return $mins . ' minute' . ($mins == 1 ? '' : 's');
+}
+
+// ─── User Ledger ─────────────────────────────────────────────
+// Tracks approved deposits and withdrawals per Telegram chat ID
+function ldLoad() {
+    if (!file_exists(RBB_LEDGER_FILE)) return [];
+    return json_decode(file_get_contents(RBB_LEDGER_FILE), true) ?: [];
+}
+function ldSave($data) {
+    file_put_contents(RBB_LEDGER_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+function ldGetUser($chatId) {
+    $ld = ldLoad();
+    return $ld[(string)$chatId] ?? [
+        'chat_id'    => $chatId,
+        'balance'    => 0,
+        'deposits'   => [],
+        'withdrawals'=> [],
+    ];
+}
+
+// Add approved deposit (called by admin)
+function ldAddDeposit($chatId, $amount, $utr, $txnId = null) {
+    $ld  = ldLoad();
+    $key = (string)$chatId;
+    if (!isset($ld[$key])) $ld[$key] = ['chat_id' => $chatId, 'balance' => 0, 'deposits' => [], 'withdrawals' => []];
+    $ld[$key]['balance']    += (float)$amount;
+    $ld[$key]['deposits'][]  = [
+        'amount' => (float)$amount,
+        'utr'    => $utr,
+        'txn_id' => $txnId,
+        'time'   => date('c'),
+        'status' => 'approved',
+    ];
+    ldSave($ld);
+}
+
+// Add withdrawal (pending)
+function ldAddWithdrawal($chatId, $amount) {
+    $ld  = ldLoad();
+    $key = (string)$chatId;
+    if (!isset($ld[$key])) $ld[$key] = ['chat_id' => $chatId, 'balance' => 0, 'deposits' => [], 'withdrawals' => []];
+    $ld[$key]['withdrawals'][] = [
+        'amount' => (float)$amount,
+        'time'   => date('c'),
+        'status' => 'pending',
+    ];
+    ldSave($ld);
+}
+
+// ─── Logging ─────────────────────────────────────────────────
+function rbbLog($text, $type = 'info') {
+    $logs = file_exists(RBB_LOG_FILE) ? (json_decode(file_get_contents(RBB_LOG_FILE), true) ?: []) : [];
+    array_unshift($logs, ['time' => date('c'), 'text' => $text, 'type' => $type]);
+    if (count($logs) > 500) $logs = array_slice($logs, 0, 500);
+    file_put_contents(RBB_LOG_FILE, json_encode($logs, JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+// ─── Telegram API ────────────────────────────────────────────
+function tg($method, $params, $token) {
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => TG_BASE . $token . '/' . $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($params),
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+    ]);
+    $r = curl_exec($ch);
+    curl_close($ch);
+    return json_decode($r, true) ?: [];
+}
+
+function tgSend($token, $chatId, $text, $keyboard = null) {
+    $params = [
+        'chat_id'                  => $chatId,
+        'text'                     => $text,
+        'parse_mode'               => 'HTML',
+        'disable_web_page_preview' => true,
+    ];
+    if ($keyboard) {
+        $params['reply_markup'] = json_encode($keyboard);
+    }
+    return tg('sendMessage', $params, $token);
+}
+
+function tgSendPhoto($token, $chatId, $photoPath, $caption = '', $keyboard = null) {
+    $ch = curl_init();
+    $fields = [
+        'chat_id'    => $chatId,
+        'caption'    => $caption,
+        'parse_mode' => 'HTML',
+        'photo'      => new CURLFile($photoPath, 'image/png', 'qr.png'),
+    ];
+    if ($keyboard) {
+        $fields['reply_markup'] = json_encode($keyboard);
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => TG_BASE . $token . '/sendPhoto',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_TIMEOUT        => 40,
+        CURLOPT_POSTFIELDS     => $fields,
+    ]);
+    $r = json_decode(curl_exec($ch), true);
+    curl_close($ch);
+    return $r;
+}
+
+function tgChunk($text, $maxLen = 4000) {
+    $chunks = [];
+    while (mb_strlen($text) > $maxLen) {
+        $pos = mb_strrpos(mb_substr($text, 0, $maxLen), "\n");
+        if ($pos === false) $pos = $maxLen;
+        $chunks[] = mb_substr($text, 0, $pos);
+        $text = mb_substr($text, $pos);
+    }
+    if (trim($text) !== '') $chunks[] = $text;
+    return $chunks ?: [''];
+}
+
+// ─── RockyBook API client ─────────────────────────────────────
+function rbApi($endpoint, $method = 'GET', $data = null, $cookieFile = null) {
+    $url = RB_API_BASE . $endpoint;
+    $cFile = $cookieFile ?? (RBB_COOKIE_DIR . 'admin.txt');
+    $headers = [
+        'Content-Type: application/json',
+        'Accept: application/json',
+        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Origin: https://rockybook.vip',
+        'Referer: https://rockybook.vip/',
+    ];
+
+    $ch = curl_init();
+    $opts = [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_COOKIEJAR      => $cFile,
+        CURLOPT_COOKIEFILE     => $cFile,
+    ];
+
+    $m = strtoupper($method);
+    if ($m === 'POST') {
+        $opts[CURLOPT_POST]       = true;
+        $opts[CURLOPT_POSTFIELDS] = $data !== null ? json_encode($data) : '{}';
+    } elseif (in_array($m, ['PUT', 'PATCH', 'DELETE'])) {
+        $opts[CURLOPT_CUSTOMREQUEST] = $m;
+        if ($data !== null) $opts[CURLOPT_POSTFIELDS] = json_encode($data);
+    }
+
+    curl_setopt_array($ch, $opts);
+    $raw  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+
+    return [
+        'code' => $code,
+        'raw'  => $raw ?: '',
+        'data' => json_decode($raw, true),
+        'error'=> $err,
+        'ok'   => $code >= 200 && $code < 300,
+    ];
+}
+
+// ─── Admin login to RockyBook ─────────────────────────────────
+function rbAdminLogin($cfg) {
+    $cookieFile = RBB_COOKIE_DIR . 'admin.txt';
+
+    // Check existing session
+    $check = rbApi('/auth/fetchUserByToken', 'GET', null, $cookieFile);
+    if ($check['ok'] && isset($check['data']['user'])) {
+        return $check['data']['user'];
+    }
+
+    $phone    = trim($cfg['rb_phone'] ?? '');
+    $password = trim($cfg['rb_password'] ?? '');
+    if (!$phone || !$password) return false;
+
+    $res = rbApi('/auth/login', 'POST', [
+        'loginType' => $phone,
+        'password'  => $password,
+    ], $cookieFile);
+
+    if (!$res['ok'] || empty($res['data'])) return false;
+    $d = $res['data'];
+    return $d['user'] ?? $d['data'] ?? ((!empty($d['success'])) ? $d : false);
+}
+
+// ─── Normalize a bank object to standard keys ─────────────────
+function rbNormalizeBank($b) {
+    if (!is_array($b) || empty($b)) return null;
+    $n = [
+        'upiId'        => $b['upiId']         ?? $b['upi']          ?? $b['vpa']            ?? null,
+        'accNo'        => $b['accNo']          ?? $b['accountNo']    ?? $b['accountNumber']   ?? $b['account_no'] ?? null,
+        'ifscCode'     => $b['ifscCode']       ?? $b['ifsc']         ?? $b['IFSC']            ?? null,
+        'bankName'     => $b['bankName']       ?? $b['bank']         ?? $b['bank_name']       ?? null,
+        'accHolderName'=> $b['accHolderName']  ?? $b['holderName']   ?? $b['accountHolder']   ?? $b['name']       ?? null,
+        'isActive'     => $b['isActive']       ?? true,
+    ];
+    // Return only if at least one useful field present
+    if ($n['upiId'] || $n['accNo'] || $n['ifscCode']) return $n;
+    return null;
+}
+
+// ─── Fetch bank details from PowerDreams payment page API ─────
+// Same API that powerdreams.co/online/pay page calls internally
+// Returns: bankDetails.upiId, accNo, ifscCode, bankName, accHolderName
+function rbGetBankDetails($cfg, $amount = 500) {
+    $branch = trim($cfg['rb_branch'] ?? 'RBVIP1D');
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => 'https://www.powerdreams.co/api/online/request/fetchAvailablePeer',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_HTTPHEADER     => [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'Origin: https://www.powerdreams.co',
+            'Referer: https://www.powerdreams.co/online/pay/' . $branch . '/test',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        ],
+        CURLOPT_POSTFIELDS     => json_encode([
+            'transactionType' => 'Deposit',
+            'branchUserName'  => $branch,
+            'amount'          => (int)$amount,
+        ]),
+    ]);
+    $raw  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    rbbLog("fetchAvailablePeer HTTP={$code} branch={$branch} amount={$amount} body=" . mb_substr($raw, 0, 500), 'info');
+
+    $data = json_decode($raw, true);
+    if (empty($data['success']) || empty($data['bankDetails'])) {
+        rbbLog("fetchAvailablePeer failed: " . ($data['message'] ?? 'no bankDetails'), 'error');
+        return null;
+    }
+
+    $bd = $data['bankDetails'];
+    return rbNormalizeBank($bd);
+}
+
+// ─── Create deposit transaction ───────────────────────────────
+function rbCreateDeposit($cfg, $userId, $amount, $mode = 'PowerPay') {
+    $branch = trim($cfg['rb_branch'] ?? 'RBVIP1D');
+    $payload = [
+        'userId'        => $userId,
+        'amount'        => (float)$amount,
+        'transactionType' => 'Deposit',
+        'role'          => 'User',
+        'mode'          => $mode,
+        'branchUserName'=> $branch,
+    ];
+    $res = rbApi('/transaction/createTransaction', 'POST', $payload);
+    if (!$res['ok']) return null;
+    $d = $res['data'];
+    if (!empty($d['success']) && isset($d['data'])) return $d['data'];
+    return $d;
+}
+
+
+// ─── Get admin user info (cached after first login) ──────────
+function rbGetAdminUser($cfg) {
+    $cacheFile = RBB_COOKIE_DIR . 'admin_user.json';
+    if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < 3600) {
+        $cached = json_decode(file_get_contents($cacheFile), true);
+        if ($cached && isset($cached['_id'])) return $cached;
+    }
+    $user = rbAdminLogin($cfg);
+    if ($user && is_array($user)) {
+        file_put_contents($cacheFile, json_encode($user, JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+    return $user;
+}
+
+// ─── Get hardcoded deposit user ID (@Ujjwal0999) ─────────────
+// Har deposit Ujjwal0999 ke account pe create hogi
+// ID auto-resolve hoti hai client name se, phir cache ho jaati hai
+function rbGetDepositUserId($cfg) {
+    $cacheFile = RBB_COOKIE_DIR . 'deposit_user.json';
+
+    // Check cache (24 hour valid)
+    if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < 86400) {
+        $cached = json_decode(file_get_contents($cacheFile), true);
+        if (!empty($cached['_id'])) return $cached;
+    }
+
+    // Find user by clientName from RockyBook
+    $clientName = RB_DEPOSIT_CLIENT;
+    $res = rbApi('/user/getUsers?page=1&limit=100000');
+    if ($res['ok']) {
+        $users = $res['data']['users'] ?? $res['data']['data'] ?? [];
+        if (is_array($users)) {
+            foreach ($users as $u) {
+                if (strtolower($u['clientName'] ?? '') === strtolower($clientName)) {
+                    $found = ['_id' => $u['_id'] ?? $u['id'], 'clientName' => $u['clientName']];
+                    file_put_contents($cacheFile, json_encode($found, JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    rbbLog("Deposit user resolved: {$clientName} → " . $found['_id'], 'info');
+                    return $found;
+                }
+            }
+        }
+    }
+
+    // Fallback: use admin user
+    rbbLog("Deposit user '{$clientName}' not found — using admin user as fallback", 'error');
+    return rbGetAdminUser($cfg);
+}
+
+// ─── Generate QR code (PHP GD — no library needed) ───────────
+function rbbGenerateQR($upiString, $outputFile) {
+    // Use a free QR API (no library needed)
+    $apis = [
+        'https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=' . urlencode($upiString),
+        'https://quickchart.io/qr?size=400&text=' . urlencode($upiString),
+        'https://chart.googleapis.com/chart?cht=qr&chs=400x400&chl=' . urlencode($upiString),
+    ];
+
+    foreach ($apis as $apiUrl) {
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $apiUrl,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 3,
+            CURLOPT_USERAGENT      => 'RBBot/1.0',
+        ]);
+        $data = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $ct   = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+        curl_close($ch);
+
+        if ($code === 200 && $data && strlen($data) > 500 && str_contains((string)$ct, 'image')) {
+            file_put_contents($outputFile, $data);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ─── Handle /Deposit command — seedha amount poochta hai ─────
+function handleDeposit($token, $chatId, $userName, $cfg) {
+    // ── Rate limit check ──────────────────────────────────────
+    $blockedUntil = rlIsBlocked($chatId);
+    if ($blockedUntil) {
+        $remaining = rlRemainingTime($blockedUntil);
+        tgSend($token, $chatId,
+            "🚫 <b>Temporarily Restricted</b>\n\n"
+          . "You started a deposit but did not complete it (no screenshot uploaded).\n\n"
+          . "⏳ Please wait <b>{$remaining}</b> before trying again.\n\n"
+          . "<i>Complete your deposit by sending a payment screenshot next time.</i>"
+        );
+        rbbLog("Rate limited — chat={$chatId} blocked for {$remaining}", 'error');
+        return;
+    }
+
+    $minDep = (int)($cfg['min_deposit'] ?? MIN_DEPOSIT);
+    $maxDep = (int)($cfg['max_deposit'] ?? 100000);
+
+    tgSend($token, $chatId,
+        "💰 <b>Deposit Amount</b>\n\n"
+      . "How much do you want to deposit?\n"
+        . "Minimum: <b>₹" . number_format($minDep) . "</b>\n"
+        . "Maximum: <b>₹" . number_format($maxDep) . "</b>\n\n"
+        . "<i>Enter amount only (e.g. 1000)</i>",
+    [
+        'inline_keyboard' => [
+            [
+                ['text' => '₹500',   'callback_data' => 'amt_500'],
+                ['text' => '₹1000',  'callback_data' => 'amt_1000'],
+                ['text' => '₹2000',  'callback_data' => 'amt_2000'],
+            ],
+            [
+                ['text' => '₹5000',  'callback_data' => 'amt_5000'],
+                ['text' => '₹10000', 'callback_data' => 'amt_10000'],
+                ['text' => '₹25000', 'callback_data' => 'amt_25000'],
+            ],
+        ],
+    ]);
+    rbbSetState($chatId, 'awaiting_amount', []);
+}
+
+// ─── Fetch URL as image bytes ─────────────────────────────────
+function rbFetchImage($url, $timeout = 25) {
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+    ]);
+    $data = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $ct   = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    curl_close($ch);
+    if ($code === 200 && $data && strlen($data) > 500) return $data;
+    return null;
+}
+
+// ─── Take screenshot of a URL ─────────────────────────────────
+// Tries microlink → screenshotone → thum.io
+function rbScreenshotUrl($url, $outputFile, $timeout = 35) {
+    $enc = urlencode($url);
+
+    // 1. microlink (best quality, returns JSON with screenshot URL)
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => "https://api.microlink.io/?url={$enc}&screenshot=true&meta=false&embed=screenshot.url&timeout=20000",
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    ]);
+    $raw = curl_exec($ch);
+    curl_close($ch);
+    $ml    = json_decode($raw, true);
+    $ssUrl = $ml['data']['screenshot']['url'] ?? $ml['data']['screenshot'] ?? null;
+    if ($ssUrl && str_starts_with($ssUrl, 'http')) {
+        $data = rbFetchImage($ssUrl, 20);
+        if ($data && strlen($data) > 500) {
+            file_put_contents($outputFile, $data);
+            return 'microlink';
+        }
+    }
+
+    // 2. screenshotone (no key, free tier)
+    $data = rbFetchImage("https://api.screenshotone.com/take?url={$enc}&viewport_width=800&viewport_height=1200&format=png&timeout=20", 25);
+    if ($data && strlen($data) > 500) {
+        file_put_contents($outputFile, $data);
+        return 'screenshotone';
+    }
+
+    // 3. thum.io (fallback)
+    $data = rbFetchImage("https://image.thum.io/get/width/800/crop/1200/png/{$enc}", 20);
+    if ($data && strlen($data) > 500) {
+        file_put_contents($outputFile, $data);
+        return 'thum.io';
+    }
+
+    return null;
+}
+
+// ─── Fetch real QR/screenshot from RockyBook payment page ────
+function rbFetchRealQR($txnId, $branch, $outputFile, $timeout = 35) {
+    // Method 1: RockyBook built-in screenshot API
+    $res = rbApi("/transaction/fetch_powerPay_transaction_screenshot/{$txnId}");
+    if ($res['ok'] && !empty($res['data'])) {
+        $d = $res['data'];
+        $imgData = $d['screenshot'] ?? $d['image'] ?? $d['data'] ?? $d['url'] ?? $d['screenshotUrl'] ?? null;
+        if ($imgData) {
+            if (str_starts_with($imgData, 'data:image')) {
+                $bytes = base64_decode(preg_replace('/^data:image\/\w+;base64,/', '', $imgData));
+                if ($bytes && strlen($bytes) > 500) {
+                    file_put_contents($outputFile, $bytes);
+                    return 'rockybook-api';
+                }
+            } elseif (str_starts_with($imgData, 'http')) {
+                $bytes = rbFetchImage($imgData, 20);
+                if ($bytes && strlen($bytes) > 500) {
+                    file_put_contents($outputFile, $bytes);
+                    return 'rockybook-api-url';
+                }
+            }
+        }
+    }
+
+    // Method 2: Screenshot of actual PowerDreams payment page
+    // (exact page that opens when user clicks Deposit on site)
+    $payUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
+    $src = rbScreenshotUrl($payUrl, $outputFile, $timeout);
+    if ($src) return "payment-page-{$src}";
+
+    return null;
+}
+
+// ─── Process deposit amount → create txn → send REAL details ─
+function processDepositAmount($token, $chatId, $amount, $rbUser, $cfg) {
+    $minDep = (int)($cfg['min_deposit'] ?? MIN_DEPOSIT);
+    $maxDep = (int)($cfg['max_deposit'] ?? 100000);
+
+    if ($amount < $minDep) {
+        tgSend($token, $chatId, "❌ Minimum deposit amount is <b>₹" . number_format($minDep) . "</b>.\n\nPlease try again:");
+        return false;
+    }
+    if ($amount > $maxDep) {
+        tgSend($token, $chatId, "❌ Maximum deposit amount is <b>₹" . number_format($maxDep) . "</b>.\n\nPlease try again:");
+        return false;
+    }
+
+    tgSend($token, $chatId, "⏳ <b>Processing...</b>\n\nCreating deposit request...");
+
+    // Login with panel credentials
+    $adminUser = rbGetAdminUser($cfg);
+    if (!$adminUser) {
+        tgSend($token, $chatId, "❌ Server error. Please contact admin.");
+        rbbLog("Deposit failed: admin RB login failed for chat {$chatId}", 'error');
+        return false;
+    }
+
+    // Always use hardcoded deposit user: @Ujjwal0999
+    $depositUser = rbGetDepositUserId($cfg);
+    $rbUserId    = $depositUser['_id'] ?? $depositUser['id'] ?? ($adminUser['_id'] ?? null);
+    $branch      = trim($cfg['rb_branch'] ?? 'RBVIP1D');
+
+    rbbLog("Creating deposit for user=" . RB_DEPOSIT_CLIENT . " id={$rbUserId} amount={$amount}", 'info');
+
+    // Create transaction on site
+    $txn   = rbCreateDeposit($cfg, $rbUserId, $amount);
+    $txnId = $txn['_id'] ?? $txn['id'] ?? $txn['transactionId'] ?? null;
+    $mode  = $txn['mode'] ?? 'PowerPay';
+
+    if (!$txnId) {
+        tgSend($token, $chatId, "❌ Transaction could not be created. Please try again later.");
+        rbbLog("Deposit failed: no txnId — chat={$chatId} amount={$amount} txn=" . json_encode($txn), 'error');
+        return false;
+    }
+
+    // ── Get REAL bank details from PowerDreams payment page API ─
+    // Same call that powerdreams.co/online/pay/{branch}/{txnId} makes
+    $bank   = rbGetBankDetails($cfg, $amount);
+    $upiId  = $bank['upiId']         ?? null;
+    $accNo  = $bank['accNo']         ?? null;
+    $ifsc   = $bank['ifscCode']      ?? null;
+    $bankNm = $bank['bankName']      ?? null;
+    $accName= $bank['accHolderName'] ?? null;
+
+    rbbLog("Bank details — upi=" . ($upiId ?? 'NULL') . " acc=" . ($accNo ?? 'NULL') . " ifsc=" . ($ifsc ?? 'NULL') . " bank=" . ($bankNm ?? 'NULL') . " name=" . ($accName ?? 'NULL'), $bank ? 'success' : 'error');
+
+    // Real payment page URL (jo site pe redirect karti hai)
+    $payPageUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
+
+    // ── Build keyboard ────────────────────────────────────────
+    $keyboard = [
+        'inline_keyboard' => [[
+            ['text' => '✅ Payment Done — Submit UTR', 'callback_data' => 'submit_utr_' . $txnId],
+        ]],
+    ];
+
+    // ── Full bank details message (always send this) ──────────
+    // Always show the payment page link as fallback
+    $payPageUrl = "https://www.powerdreams.co/online/pay/{$branch}/{$txnId}";
+
+    $bankMsg = "🎯 <b>Rebel B2W Deposit Details</b>\n\n"
+             . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
+             . "🔖 Txn ID: <code>{$txnId}</code>\n";
+
+    if ($upiId || $accNo) {
+        $bankMsg .= "\n<b>💳 Bank / UPI Details:</b>\n"
+                 . ($upiId   ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
+                 . ($accName ? "👤 Name: <b>{$accName}</b>\n" : '')
+                 . ($accNo   ? "🔢 Acc No: <code>{$accNo}</code>\n" : '')
+                 . ($ifsc    ? "🏛 IFSC: <code>{$ifsc}</code>\n" : '')
+                 . ($bankNm  ? "🏦 Bank: {$bankNm}\n" : '');
+    } else {
+        // No bank details — show payment page link directly
+        $bankMsg .= "\n🌐 <b>Payment Page:</b>\n<code>{$payPageUrl}</code>\n\n"
+                  . "<i>Open the link above to scan QR and pay</i>\n";
+    }
+
+    $bankMsg .= "\n⚠️ <b>Send exact amount ₹" . number_format($amount) . " only</b>\n\n"
+             . "After payment, send your UTR number or screenshot here 👇";
+
+    // ── QR / Screenshot ───────────────────────────────────────
+    tgSend($token, $chatId, "⏳ Fetching payment QR...");
+
+    $qrFile = RBB_QR_DIR . 'qr_' . $chatId . '_' . time() . '.png';
+    sleep(3); // payment page initialize hone do
+
+    // Step 1: Try RockyBook screenshot API + payment page screenshot
+    $qrSource = rbFetchRealQR($txnId, $branch, $qrFile);
+
+    if ($qrSource && file_exists($qrFile) && filesize($qrFile) > 500) {
+        // Send screenshot with bank details caption
+        $caption = "📸 <b>Payment QR — Rebel B2W</b>\n\n"
+                 . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
+                 . ($upiId ? "📱 UPI ID: <code>{$upiId}</code>\n" : '')
+                 . "🔖 Txn ID: <code>{$txnId}</code>\n"
+                 . "\n⚠️ Send exact amount ₹" . number_format($amount) . " only";
+        $r = tgSendPhoto($token, $chatId, $qrFile, $caption, null);
+        @unlink($qrFile);
+        if (!empty($r['ok'])) {
+            // Also send full bank details as separate message
+            tgSend($token, $chatId, $bankMsg, $keyboard);
+            rbbLog("Real QR screenshot sent — chat={$chatId} txn={$txnId} src={$qrSource}", 'success');
+            goto save_state;
+        }
+    }
+
+    // Step 2: Generate UPI QR from UPI ID (if screenshot failed)
+    if ($upiId) {
+        $upiStr = "upi://pay?pa={$upiId}&am={$amount}&cu=INR&tn=RebelB2W";
+        $upiQrFile = RBB_QR_DIR . 'upi_' . $chatId . '_' . time() . '.png';
+        $qrApis = [
+            "https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=" . urlencode($upiStr),
+            "https://quickchart.io/qr?size=512&text=" . urlencode($upiStr),
+            "https://chart.googleapis.com/chart?cht=qr&chs=512x512&chl=" . urlencode($upiStr),
+        ];
+        $upiQrSent = false;
+        foreach ($qrApis as $qrApi) {
+            $bytes = rbFetchImage($qrApi, 12);
+            if ($bytes && strlen($bytes) > 500) {
+                file_put_contents($upiQrFile, $bytes);
+                $caption = "📱 <b>UPI QR Code</b>\n\n"
+                         . "💰 Amount: <b>₹" . number_format($amount) . "</b>\n"
+                         . "📱 UPI ID: <code>{$upiId}</code>\n"
+                         . "🔖 Txn ID: <code>{$txnId}</code>";
+                $r = tgSendPhoto($token, $chatId, $upiQrFile, $caption, null);
+                @unlink($upiQrFile);
+                if (!empty($r['ok'])) {
+                    $upiQrSent = true;
+                    tgSend($token, $chatId, $bankMsg, $keyboard);
+                    rbbLog("UPI QR sent — chat={$chatId} txn={$txnId}", 'success');
+                    break;
+                }
+            }
+        }
+        if (!$upiQrSent) {
+            tgSend($token, $chatId,
+                $bankMsg
+                . "\n\n🔗 UPI Pay: <code>{$upiStr}</code>"
+                . "\n\n🌐 Payment Page: " . $payPageUrl,
+                $keyboard
+            );
+            rbbLog("Text-only deposit sent — chat={$chatId} txn={$txnId}", 'info');
+        }
+    } else {
+        // No UPI ID — send bank details + payment page link
+        tgSend($token, $chatId,
+            $bankMsg . "\n\n🌐 Open this link to pay:\n" . $payPageUrl,
+            $keyboard
+        );
+        rbbLog("Bank details sent (no UPI) — chat={$chatId} txn={$txnId}", 'info');
+    }
+
+    save_state:
+
+    // Save state for UTR submission
+    rbbSetState($chatId, 'awaiting_utr', [
+        'amount'  => $amount,
+        'txn_id'  => $txnId,
+        'upi_id'  => $upiId,
+        'pay_url' => $payPageUrl,
+    ]);
+
+    // Record as incomplete deposit — user must upload screenshot
+    rlStartDeposit($chatId);
+
+    // Notify admin
+    $adminChatId = trim($cfg['admin_chat_id'] ?? '');
+    if ($adminChatId) {
+        tgSend($token, $adminChatId,
+            "🆕 <b>New Deposit</b>\n\n"
+          . "📊 TG: <code>{$chatId}</code>\n"
+          . "💰 Amount: ₹" . number_format($amount) . "\n"
+          . "🔖 Txn: <code>{$txnId}</code>\n"
+          . ($upiId ? "📱 UPI: <code>{$upiId}</code>\n" : '')
+          . "🌐 Mode: {$mode}\n"
+          . "🕐 " . date('d/m/Y H:i:s')
+        );
+    }
+
+    return true;
+}
+
+// ─── Extract UTR from screenshot via PowerDreams OCR ─────────
+function pdExtractUtrFromImage($imageBytes, $mimeType = 'image/jpeg') {
+    $tmpFile = sys_get_temp_dir() . '/rbb_ss_' . uniqid() . '.jpg';
+    file_put_contents($tmpFile, $imageBytes);
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => 'https://www.powerdreams.co/api/online/ocr/extract-utr',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_HTTPHEADER     => [
+            'Origin: https://www.powerdreams.co',
+            'Referer: https://www.powerdreams.co/online/pay/',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        ],
+        CURLOPT_POSTFIELDS     => [
+            'image' => new CURLFile($tmpFile, $mimeType, 'screenshot.jpg'),
+        ],
+    ]);
+    $raw  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    @unlink($tmpFile);
+
+    rbbLog("OCR extract-utr HTTP={$code} body=" . mb_substr($raw, 0, 200), 'info');
+    $data = json_decode($raw, true);
+    if (!empty($data['success']) && !empty($data['utr'])) {
+        return trim($data['utr']);
+    }
+    return null;
+}
+
+// ─── Download a Telegram file ─────────────────────────────────
+function tgDownloadFile($token, $fileId) {
+    // Get file path
+    $r = tg('getFile', ['file_id' => $fileId], $token);
+    $filePath = $r['result']['file_path'] ?? null;
+    if (!$filePath) return null;
+
+    $url = "https://api.telegram.org/file/bot{$token}/{$filePath}";
+    $ch  = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $bytes = curl_exec($ch);
+    curl_close($ch);
+    return ($bytes && strlen($bytes) > 100) ? $bytes : null;
+}
+
+// ─── Handle screenshot + UTR match check ─────────────────────
+// Called when user sends a screenshot (with or without UTR)
+function handleScreenshotUtr($token, $chatId, $msg, $state, $cfg) {
+    $data    = $state['data'] ?? [];
+    $amount  = $data['amount'] ?? 0;
+    $txnId   = $data['txn_id'] ?? null;
+    $savedUtr = trim($data['utr'] ?? '');
+
+    $photo = $msg['photo'] ?? null;
+    $doc   = $msg['document'] ?? null;
+
+    // Get the file
+    $fileId = null;
+    $mime   = 'image/jpeg';
+    if ($photo) {
+        // Telegram sends array of sizes — take largest
+        $largest = end($photo);
+        $fileId  = $largest['file_id'];
+    } elseif ($doc) {
+        $fileId = $doc['file_id'];
+        $mime   = $doc['mime_type'] ?? 'image/jpeg';
+    }
+
+    if (!$fileId) {
+        tgSend($token, $chatId, "❌ Could not read the image. Please send a clear screenshot.");
+        return;
+    }
+
+    tgSend($token, $chatId, "⏳ Verifying your screenshot...");
+
+    // Download screenshot
+    $imageBytes = tgDownloadFile($token, $fileId);
+    if (!$imageBytes) {
+        tgSend($token, $chatId, "❌ Could not download image. Please try again.");
+        return;
+    }
+
+    // Extract UTR from screenshot via OCR
+    $ocrUtr = pdExtractUtrFromImage($imageBytes, $mime);
+    rbbLog("OCR UTR={$ocrUtr} savedUtr={$savedUtr} chat={$chatId}", 'info');
+
+    // Match check
+    if ($savedUtr && $ocrUtr) {
+        // Normalize: remove spaces, uppercase
+        $n1 = strtoupper(preg_replace('/\s+/', '', $savedUtr));
+        $n2 = strtoupper(preg_replace('/\s+/', '', $ocrUtr));
+
+        if ($n1 !== $n2) {
+            // UTR mismatch
+            tgSend($token, $chatId,
+                "❌ <b>UTR Didn't Match!</b>\n\n"
+              . "You entered: <code>{$savedUtr}</code>\n"
+              . "Screenshot shows: <code>{$ocrUtr}</code>\n\n"
+              . "Please send the correct screenshot or re-enter the UTR."
+            );
+            rbbLog("UTR mismatch — entered={$savedUtr} ocr={$ocrUtr} chat={$chatId}", 'error');
+            return; // Keep state so user can retry
+        }
+    } elseif ($savedUtr && !$ocrUtr) {
+        // OCR failed — warn but allow
+        tgSend($token, $chatId, "⚠️ Could not read UTR from screenshot automatically. Submitting for manual review...");
+    } elseif (!$savedUtr && $ocrUtr) {
+        // No UTR saved yet — use OCR result
+        $savedUtr = $ocrUtr;
+    }
+
+    // ✅ Match or no OCR — submit
+    tgSend($token, $chatId,
+        "✅ <b>Request Queued!</b>\n\n"
+      . "Your payment has been submitted for verification.\n"
+      . ($savedUtr ? "🔢 UTR: <code>{$savedUtr}</code>\n" : '')
+      . "Admin will confirm shortly."
+    );
+
+    rbbClearState($chatId);
+    rlCompleted($chatId); // remove rate limit restriction
+
+    // Notify admin with screenshot forwarded
+    $adminChatId = trim($cfg['admin_chat_id'] ?? '');
+    if ($adminChatId) {
+        tg('forwardMessage', [
+            'chat_id'      => $adminChatId,
+            'from_chat_id' => $chatId,
+            'message_id'   => $msg['message_id'],
+        ], $token);
+        tgSend($token, $adminChatId,
+            "✅ <b>Payment Verified</b>\n\n"
+          . "📊 TG: <code>{$chatId}</code>\n"
+          . "💰 Amount: ₹" . number_format($amount) . "\n"
+          . "🔢 UTR: <code>{$savedUtr}</code>\n"
+          . ($ocrUtr ? "🤖 OCR UTR: <code>{$ocrUtr}</code>\n" : '')
+          . ($txnId  ? "🔖 Txn: <code>{$txnId}</code>\n" : '')
+          . "🕐 " . date('d/m/Y H:i:s')
+        );
+    }
+    rbbLog("Payment verified — chat={$chatId} utr={$savedUtr} ocr={$ocrUtr} txn={$txnId}", 'success');
+}
+
+// ─── Process UTR submission (text only) ──────────────────────
+function processUtrSubmission($token, $chatId, $utr, $state, $cfg) {
+    // Save UTR in state, ask for screenshot
+    $data         = $state['data'] ?? [];
+    $data['utr']  = $utr;
+
+    tgSend($token, $chatId,
+        "✅ UTR noted: <code>{$utr}</code>\n\n"
+      . "📸 <b>Now send your payment screenshot</b> to confirm.\n\n"
+      . "<i>Screenshot must show the same UTR number for verification.</i>"
+    );
+
+    rbbSetState($chatId, 'awaiting_screenshot', $data);
+    rbbLog("UTR noted — chat={$chatId} utr={$utr} waiting for screenshot", 'info');
+}
+
+// ─── Handle withdrawal QR code upload ────────────────────────
+function handleWithdrawalQr($token, $chatId, $msg, $state, $cfg) {
+    $data    = $state['data'] ?? [];
+    $wAmount = (float)($data['w_amount'] ?? 0);
+    $bal     = (float)($data['balance'] ?? 0);
+
+    // Forward QR to admin
+    $adminChatId = trim($cfg['admin_chat_id'] ?? '');
+    $contact     = WITHDRAWAL_CONTACT;
+
+    if ($adminChatId) {
+        tg('forwardMessage', [
+            'chat_id'      => $adminChatId,
+            'from_chat_id' => $chatId,
+            'message_id'   => $msg['message_id'],
+        ], $token);
+        tgSend($token, $adminChatId,
+            "💸 <b>Withdrawal Request</b>\n\n"
+          . "📊 TG: <code>{$chatId}</code>\n"
+          . "💰 Amount: ₹" . number_format($wAmount, 2) . "\n"
+          . "💳 Available Balance: ₹" . number_format($bal, 2) . "\n"
+          . "🕐 " . date('d/m/Y H:i:s')
+        );
+    }
+
+    // Record withdrawal
+    ldAddWithdrawal($chatId, $wAmount);
+    rbbClearState($chatId);
+
+    // Confirm to user
+    tgSend($token, $chatId,
+        "✅ <b>Withdrawal Request Accepted</b>\n\n"
+      . "💰 Amount: <b>₹" . number_format($wAmount, 2) . "</b>\n\n"
+      . "Your request has been received. Please contact {$contact} for further assistance."
+    );
+
+    rbbLog("Withdrawal QR submitted — chat={$chatId} amount={$wAmount}", 'success');
+}
+
+// ─── Main webhook handler ─────────────────────────────────────
+function handleUpdate($update, $cfg) {
+    $token = trim($cfg['bot_token'] ?? '');
+    if (!$token) return;
+
+    // Callback query (inline buttons)
+    if (isset($update['callback_query'])) {
+        $cq     = $update['callback_query'];
+        $chatId = $cq['message']['chat']['id'] ?? '';
+        $data   = $cq['data'] ?? '';
+        $cqId   = $cq['id'] ?? '';
+
+        // Acknowledge
+        tg('answerCallbackQuery', ['callback_query_id' => $cqId], $token);
+
+        if (str_starts_with($data, 'amt_')) {
+            $amount = (int)substr($data, 4);
+            processDepositAmount($token, $chatId, $amount, [], $cfg);
+            return;
+        }
+
+        if (str_starts_with($data, 'submit_utr_')) {
+            $state = rbbGetState($chatId);
+            if ($state) {
+                tgSend($token, $chatId,
+                    "🔢 <b>Step 1: Enter your UTR Number</b>\n\n"
+                  . "<i>This is the 12-digit transaction reference / UTR from your bank app</i>"
+                );
+                rbbSetState($chatId, 'awaiting_utr_text', $state['data']);
+            }
+            return;
+        }
+
+        return;
+    }
+
+    // Regular message
+    $msg    = $update['message'] ?? $update['channel_post'] ?? null;
+    if (!$msg) return;
+
+    $chatId   = $msg['chat']['id'] ?? '';
+    $text     = trim($msg['text'] ?? '');
+    $userName = $msg['from']['username'] ?? $msg['from']['first_name'] ?? 'User';
+    $photo    = $msg['photo'] ?? null;
+    $doc      = $msg['document'] ?? null;
+
+    if (!$chatId) return;
+
+    // Handle image/photo uploads
+    $state = rbbGetState($chatId);
+    if ($state && ($photo || $doc)) {
+        $st = $state['state'] ?? '';
+
+        // Deposit screenshot verification
+        if (in_array($st, ['awaiting_utr', 'awaiting_utr_text', 'awaiting_screenshot'])) {
+            handleScreenshotUtr($token, $chatId, $msg, $state, $cfg);
+            return;
+        }
+
+        // Withdrawal QR code upload
+        if ($st === 'awaiting_withdrawal_qr') {
+            handleWithdrawalQr($token, $chatId, $msg, $state, $cfg);
+            return;
+        }
+    }
+
+    // Commands
+    $cmd = strtolower(explode('@', explode(' ', $text)[0])[0]);
+
+    if ($cmd === '/start') {
+        $welcome = str_replace('\n', "\n", $cfg['welcome_msg'] ?? "Welcome to Rebel B2W!");
+        tgSend($token, $chatId, $welcome, [
+            'keyboard' => [
+                [['text' => '💰 Deposit'], ['text' => '💸 Withdraw']],
+                [['text' => '💳 Balance'],  ['text' => '❓ Help']],
+            ],
+            'resize_keyboard'   => true,
+            'one_time_keyboard' => false,
+        ]);
+
+        rbbClearState($chatId);
+        return;
+    }
+
+    if ($cmd === '/deposit' || $text === '💰 Deposit') {
+        handleDeposit($token, $chatId, $userName, $cfg);
+        return;
+    }
+
+    if ($cmd === '/balance' || $text === '💳 Balance') {
+        $user = ldGetUser($chatId);
+        $bal  = (float)($user['balance'] ?? 0);
+
+        // Recent approved deposits
+        $deps = array_slice(array_reverse($user['deposits'] ?? []), 0, 5);
+        $depLines = '';
+        foreach ($deps as $d) {
+            $t = date('d/m/Y', strtotime($d['time']));
+            $depLines .= "\n✅ ₹" . number_format($d['amount']) . " — {$t}" . ($d['utr'] ? " (UTR: {$d['utr']})" : '');
+        }
+
+        tgSend($token, $chatId,
+            "💳 <b>Your Rebel B2W Balance</b>\n\n"
+          . "💰 Available Balance: <b>₹" . number_format($bal, 2) . "</b>\n\n"
+          . ($depLines ? "<b>Recent Deposits:</b>" . $depLines : "<i>No approved deposits yet.</i>")
+          . "\n\n<i>Balance is credited after admin approves your payment.</i>"
+        );
+        return;
+    }
+
+    if ($cmd === '/withdrawal' || $text === '💸 Withdraw') {
+        $user = ldGetUser($chatId);
+        $bal  = (float)($user['balance'] ?? 0);
+        if ($bal <= 0) {
+            tgSend($token, $chatId,
+                "❌ <b>Insufficient Balance</b>\n\n"
+              . "Your current balance is <b>₹0</b>.\n"
+              . "Make a deposit first to request withdrawal."
+            );
+            return;
+        }
+        tgSend($token, $chatId,
+            "💸 <b>Withdrawal Request</b>\n\n"
+          . "💰 Your Balance: <b>₹" . number_format($bal, 2) . "</b>\n\n"
+          . "Enter the amount you want to withdraw:"
+        );
+        rbbSetState($chatId, 'awaiting_withdrawal_amount', ['balance' => $bal]);
+        return;
+    }
+
+    if ($cmd === '/help' || $text === '❓ Help') {
+        tgSend($token, $chatId,
+            "❓ <b>Help</b>\n\n"
+          . "/Deposit — Make a deposit\n"
+          . "/Withdrawal — Request a withdrawal\n"
+          . "/Balance — Check your balance\n"
+          . "/Start — Restart bot\n\n"
+          . "For support contact " . WITHDRAWAL_CONTACT
+        );
+        return;
+    }
+
+    // State machine
+    if (!$state) {
+        tgSend($token, $chatId, "👇 What would you like to do?\n\n/Deposit — Make a deposit\n/Balance — Check balance\n/Help — Get help");
+        return;
+    }
+
+    switch ($state['state']) {
+
+        case 'awaiting_amount':
+            $amount = (float)preg_replace('/[^0-9.]/', '', $text);
+            if ($amount <= 0) {
+                tgSend($token, $chatId, "❌ Please enter a valid amount (numbers only).\n\nExample: <code>1000</code>");
+                return;
+            }
+            processDepositAmount($token, $chatId, (int)$amount, [], $cfg);
+            break;
+
+        case 'awaiting_utr':
+        case 'awaiting_utr_text':
+            $utr = trim(preg_replace('/[^a-zA-Z0-9]/', '', $text));
+            if (strlen($utr) < 6) {
+                tgSend($token, $chatId, "❌ Please enter a valid UTR / reference number.");
+                return;
+            }
+            processUtrSubmission($token, $chatId, $utr, $state, $cfg);
+            break;
+
+        case 'awaiting_screenshot':
+            // User sent text instead of screenshot
+            tgSend($token, $chatId, "📸 Please send a <b>screenshot</b> of your payment (not text).");
+            break;
+
+        case 'awaiting_withdrawal_amount':
+            $wAmount = (float)preg_replace('/[^0-9.]/', '', $text);
+            $bal     = (float)($state['data']['balance'] ?? 0);
+            if ($wAmount <= 0) {
+                tgSend($token, $chatId, "❌ Please enter a valid amount.\n\nExample: <code>500</code>");
+                return;
+            }
+            if ($wAmount > $bal) {
+                tgSend($token, $chatId,
+                    "❌ Insufficient balance.\n\n"
+                  . "Available: <b>₹" . number_format($bal, 2) . "</b>\n"
+                  . "Requested: <b>₹" . number_format($wAmount, 2) . "</b>"
+                );
+                return;
+            }
+            // Ask for QR code
+            tgSend($token, $chatId,
+                "📸 <b>Send your UPI QR Code</b>\n\n"
+              . "Amount: <b>₹" . number_format($wAmount, 2) . "</b>\n\n"
+              . "Send a screenshot of your UPI QR code so we can process your withdrawal."
+            );
+            rbbSetState($chatId, 'awaiting_withdrawal_qr', [
+                'balance'  => $bal,
+                'w_amount' => $wAmount,
+            ]);
+            break;
+
+        case 'awaiting_withdrawal_qr':
+            // Text instead of QR image
+            tgSend($token, $chatId, "📸 Please send your <b>UPI QR code image</b> (not text).");
+            break;
+
+        default:
+            rbbClearState($chatId);
+            tgSend($token, $chatId, "👇 /Deposit — Make a deposit\n/Balance — Check balance");
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// ─── Web Entry Points ─────────────────────────────────────
+// ────────────────────────────────────────────────────────────
+
+$cfg = rbbLoadConfig();
+
+// ─── Webhook endpoint ─────────────────────────────────────────
+if (isset($_GET['webhook'])) {
+    $update = json_decode(file_get_contents('php://input'), true);
+    if (is_array($update)) {
+        handleUpdate($update, $cfg);
+    }
+    http_response_code(200);
+    exit;
+}
+
+// ─── Admin API ────────────────────────────────────────────────
+session_start();
+$isLoggedIn = !empty($_SESSION['rbb_ok']);
+
+if (isset($_GET['api_action'])) {
+    header('Content-Type: application/json');
+    $act = preg_replace('/[^a-zA-Z0-9_]/', '', $_GET['api_action'] ?? '');
+
+    if ($act === 'login') {
+        $pass = $_POST['pass'] ?? '';
+        if ($pass === $cfg['admin_pass']) {
+            $_SESSION['rbb_ok'] = true;
+            echo json_encode(['ok' => true]); exit;
+        }
+        echo json_encode(['ok' => false, 'error' => 'Wrong password']); exit;
+    }
+
+    if (!$isLoggedIn) { echo json_encode(['ok' => false, 'error' => 'Not logged in']); exit; }
+
+    $body = json_decode(file_get_contents('php://input'), true) ?? [];
+
+    switch ($act) {
+        case 'logout':
+            session_unset(); session_destroy();
+            echo json_encode(['ok' => true]); exit;
+
+        case 'get_config':
+            $safe = $cfg; unset($safe['admin_pass']);
+            echo json_encode(['ok' => true, 'data' => $safe]); exit;
+
+        case 'save_config':
+            $newCfg = $cfg;
+            foreach (['bot_token','admin_chat_id','rb_phone','rb_password','rb_branch','rb_bank_id','welcome_msg','deposit_thanks'] as $k) {
+                if (isset($body[$k])) $newCfg[$k] = trim($body[$k]);
+            }
+            foreach (['min_deposit','max_deposit'] as $k) {
+                if (isset($body[$k])) $newCfg[$k] = (int)$body[$k];
+            }
+            if (!empty($body['new_pass']) && strlen(trim($body['new_pass'])) >= 4) {
+                $newCfg['admin_pass'] = trim($body['new_pass']);
+            }
+            rbbSaveConfig($newCfg);
+            $cfg = $newCfg;
+            rbbLog('Config saved', 'info');
+            echo json_encode(['ok' => true]); exit;
+
+        case 'set_webhook':
+            $wToken = trim($cfg['bot_token'] ?? '');
+            if (!$wToken) { echo json_encode(['ok' => false, 'error' => 'Bot token not set']); exit; }
+            $pr  = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https://' : 'http://';
+            $wUrl = $pr . $_SERVER['HTTP_HOST'] . strtok($_SERVER['REQUEST_URI'], '?') . '?webhook=1';
+            $r = tg('setWebhook', ['url' => $wUrl, 'allowed_updates' => ['message', 'channel_post', 'callback_query']], $wToken);
+            echo json_encode(['ok' => $r['ok'] ?? false, 'webhook_url' => $wUrl, 'tg' => $r]); exit;
+
+        case 'remove_webhook':
+            $wToken = trim($cfg['bot_token'] ?? '');
+            if (!$wToken) { echo json_encode(['ok' => false, 'error' => 'Bot token not set']); exit; }
+            $r = tg('deleteWebhook', [], $wToken);
+            echo json_encode(['ok' => $r['ok'] ?? false]); exit;
+
+        case 'test_rb_login':
+            @unlink(RBB_COOKIE_DIR . 'admin.txt');
+            $user = rbAdminLogin($cfg);
+            echo json_encode($user ? ['ok' => true, 'user' => $user] : ['ok' => false, 'error' => 'Login failed']); exit;
+
+        case 'test_bank':
+            $bank = rbGetBankDetails($cfg, 500);
+            echo json_encode([
+                'ok'     => (bool)$bank,
+                'bank'   => $bank,
+                'source' => 'powerdreams.co/api/online/request/fetchAvailablePeer',
+            ]); exit;
+
+        case 'test_screenshot':
+            // Screenshot rockybook.vip and send to admin chat
+            $tok = trim($cfg['bot_token'] ?? '');
+            $cid = trim($body['chat_id'] ?? $cfg['admin_chat_id'] ?? '');
+            $url = trim($body['url'] ?? 'https://rockybook.vip');
+            if (!$tok || !$cid) { echo json_encode(['ok' => false, 'error' => 'Bot token / chat_id missing']); exit; }
+            $ssFile = RBB_QR_DIR . 'test_ss_' . time() . '.png';
+            $src = rbScreenshotUrl($url, $ssFile, 40);
+            if ($src && file_exists($ssFile) && filesize($ssFile) > 500) {
+                $r = tgSendPhoto($tok, $cid, $ssFile, "📸 <b>Screenshot Test</b>\n🌐 <code>" . htmlspecialchars($url) . "</code>\n✅ Source: <b>{$src}</b>\n🕐 " . date('d/m/Y H:i:s'), null);
+                @unlink($ssFile);
+                echo json_encode(['ok' => !empty($r['ok']), 'source' => $src, 'tg' => $r]); exit;
+            }
+            @unlink($ssFile);
+            echo json_encode(['ok' => false, 'error' => "Screenshot fetch failed — tried microlink, screenshotone, thum.io", 'source' => null]); exit;
+
+        case 'send_test':
+            $cid = trim($body['chat_id'] ?? $cfg['admin_chat_id'] ?? '');
+            $tok = trim($cfg['bot_token'] ?? '');
+            if (!$cid || !$tok) { echo json_encode(['ok' => false, 'error' => 'Bot token / chat_id missing']); exit; }
+            $r = tgSend($tok, $cid, "✅ <b>Rebel B2W</b> is working!\n\n" . date('d/m/Y H:i:s'));
+            echo json_encode(['ok' => $r['ok'] ?? false]); exit;
+
+        case 'approve_deposit':
+            // Admin approves a deposit — credits user balance
+            $chatIdApprove = trim($body['chat_id'] ?? '');
+            $approveAmount = (float)($body['amount'] ?? 0);
+            $approveUtr    = trim($body['utr'] ?? '');
+            $approveTxn    = trim($body['txn_id'] ?? '');
+            if (!$chatIdApprove || $approveAmount <= 0) {
+                echo json_encode(['ok' => false, 'error' => 'chat_id and amount required']); exit;
+            }
+            ldAddDeposit($chatIdApprove, $approveAmount, $approveUtr, $approveTxn);
+            // Notify user
+            $tok = trim($cfg['bot_token'] ?? '');
+            if ($tok) {
+                tgSend($tok, $chatIdApprove,
+                    "✅ <b>Deposit Approved!</b>\n\n"
+                  . "💰 ₹" . number_format($approveAmount, 2) . " has been credited to your account.\n"
+                  . ($approveUtr ? "🔢 UTR: <code>{$approveUtr}</code>\n" : '')
+                  . "\nUse /Balance to check your balance."
+                );
+            }
+            rbbLog("Deposit approved — chat={$chatIdApprove} amount={$approveAmount} utr={$approveUtr}", 'success');
+            echo json_encode(['ok' => true, 'user' => ldGetUser($chatIdApprove)]); exit;
+
+        case 'get_ledger':
+            $ld = ldLoad();
+            echo json_encode(['ok' => true, 'ledger' => $ld, 'total_users' => count($ld)]); exit;
+
+        case 'get_blocked_users':
+            $rl = rlLoad();
+            $now = time();
+            $blocked = [];
+            foreach ($rl as $cid => $rec) {
+                if (!empty($rec['blocked_until']) && $rec['blocked_until'] > $now) {
+                    $blocked[$cid] = [
+                        'blocked_until'  => $rec['blocked_until'],
+                        'remaining_mins' => ceil(($rec['blocked_until'] - $now) / 60),
+                        'incomplete'     => $rec['incomplete'] ?? 0,
+                    ];
+                }
+            }
+            echo json_encode(['ok' => true, 'blocked' => $blocked, 'total' => count($blocked)]); exit;
+
+        case 'unblock_user':
+            $cid = trim($body['chat_id'] ?? '');
+            if (!$cid) { echo json_encode(['ok' => false, 'error' => 'chat_id required']); exit; }
+            rlCompleted($cid);
+            echo json_encode(['ok' => true, 'msg' => "User {$cid} unblocked"]); exit;
+
+        case 'get_deposit_logs':
+            // Return last 50 deposit states/transactions from log
+            $logs = file_exists(RBB_LOG_FILE) ? (json_decode(file_get_contents(RBB_LOG_FILE), true) ?: []) : [];
+            $depLogs = array_values(array_filter($logs, fn($l) => str_contains($l['text'] ?? '', 'Deposit') || str_contains($l['text'] ?? '', 'UTR')));
+            echo json_encode(['ok' => true, 'data' => array_slice($depLogs, 0, 50), 'count' => count($depLogs)]); exit;
+
+        case 'get_logs':
+            $logs = file_exists(RBB_LOG_FILE) ? (json_decode(file_get_contents(RBB_LOG_FILE), true) ?: []) : [];
+            echo json_encode(['ok' => true, 'data' => array_slice($logs, 0, 150)]); exit;
+
+        case 'clear_logs':
+            file_put_contents(RBB_LOG_FILE, '[]', LOCK_EX);
+            echo json_encode(['ok' => true]); exit;
+
+        default:
+            echo json_encode(['ok' => false, 'error' => 'Unknown action']); exit;
+    }
+}
+
+// ─── HTML Admin Panel ─────────────────────────────────────────
+header('X-Frame-Options: SAMEORIGIN');
+header('X-Content-Type-Options: nosniff');
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rebel B2W <?= RBB_VERSION ?></title>
+<style>
+:root{--bg:#0e0e12;--s1:#15151c;--s2:#1c1c26;--b:#2a2a3a;--t:#e8e8f0;--td:#8888aa;--tf:#555577;--c:#7c7cff;--g:#39ff14;--r:#ff4466;--y:#ffd700;--or:#ff8c00;--rb:#ff6b1a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--t);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;min-height:100vh}
+.wrap{max-width:900px;margin:0 auto;padding:20px 16px}
+h1{color:var(--rb);font-size:22px;margin-bottom:4px}
+.sub{color:var(--td);font-size:12px;margin-bottom:20px}
+.card{background:var(--s1);border:1px solid var(--b);border-radius:12px;padding:18px;margin-bottom:16px}
+.card h2{font-size:15px;color:var(--c);margin-bottom:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+label{display:block;color:var(--td);font-size:11px;margin-bottom:4px}
+input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--b);color:var(--t);border-radius:6px;padding:8px 10px;font-size:13px;font-family:inherit;outline:none;transition:border .2s}
+input:focus,select:focus,textarea:focus{border-color:var(--c)}
+textarea{resize:vertical;min-height:60px;font-size:12px}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 14px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:600;transition:.18s}
+.bc{background:var(--c);color:#000}.bc:hover{background:#9090ff}
+.bg{background:var(--g);color:#000}.bg:hover{opacity:.85}
+.br{background:var(--r);color:#fff}.br:hover{opacity:.85}
+.by{background:var(--y);color:#000}.by:hover{opacity:.85}
+.bor{background:var(--or);color:#fff}.bor:hover{opacity:.85}
+.brb{background:var(--rb);color:#fff}.brb:hover{opacity:.85}
+.bgr{background:var(--s2);color:var(--t);border:1px solid var(--b)}.bgr:hover{border-color:var(--c)}
+.bsm{padding:5px 10px;font-size:11px}
+.flex-end{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}
+.f1{flex:1}
+.log-box{background:var(--s2);border:1px solid var(--b);border-radius:8px;padding:12px;max-height:320px;overflow-y:auto;font-family:'Share Tech Mono',monospace;font-size:11px}
+.log-entry{padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.log-ok{color:var(--g)}.log-err{color:var(--r)}.log-info{color:var(--c)}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--s1);border:1px solid var(--b);border-radius:8px;padding:12px 18px;font-size:13px;z-index:999;transition:.3s;opacity:0;pointer-events:none}
+.toast.show{opacity:1;pointer-events:all}
+.login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:var(--s1);border:1px solid var(--b);border-radius:14px;padding:32px;width:320px;text-align:center}
+.login-box h2{color:var(--rb);margin-bottom:6px}
+.login-box p{color:var(--td);font-size:12px;margin-bottom:20px}
+.info-box{background:rgba(57,255,20,.06);border:1px solid rgba(57,255,20,.2);border-radius:8px;padding:12px;font-size:12px;color:var(--g);margin-bottom:14px}
+.user-table{width:100%;border-collapse:collapse;font-size:12px}
+.user-table th,.user-table td{padding:8px 10px;border-bottom:1px solid var(--b);text-align:left}
+.user-table th{color:var(--td);font-weight:600}
+.mono{font-family:'Share Tech Mono',monospace;font-size:11px}
+@media(max-width:600px){.row{flex-direction:column}}
+</style>
+</head>
+<body>
+
+<?php if (!$isLoggedIn): ?>
+<div class="login-wrap">
+  <div class="login-box">
+    <h2>💰 Rebel B2W</h2>
+    <p>Admin Panel — Bot Configuration</p>
+    <div style="margin-bottom:12px"><label>Password</label><input type="password" id="lpass" placeholder="Admin password" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <button class="btn brb" style="width:100%" onclick="doLogin()">🔓 Login</button>
+    <div id="lerr" style="color:var(--r);font-size:12px;margin-top:10px"></div>
+  </div>
+</div>
+<script>
+async function doLogin(){
+  const p=document.getElementById('lpass').value;
+  const fd=new FormData();fd.append('pass',p);
+  const r=await fetch('?api_action=login',{method:'POST',body:fd}).then(x=>x.json());
+  if(r.ok) location.reload();
+  else document.getElementById('lerr').textContent=r.error||'Wrong password';
+}
+document.getElementById('lpass').focus();
+</script>
+</body></html>
+<?php exit; endif; ?>
+
+<div class="wrap">
+  <h1>💰 Rebel B2W <small style="font-size:13px;color:var(--td)">v<?= RBB_VERSION ?></small></h1>
+  <div class="sub">Telegram bot — Users deposit karte hain, QR code automatically milta hai | <a href="?api_action=logout" style="color:var(--r)">Logout</a></div>
+
+  <div class="info-box">
+    ✅ <b>Bot Flow: User /Deposit → Enter amount → QR code + bank details sent → User pays → Sends UTR/screenshot → Admin gets notification
+  </div>
+
+  <!-- Action Bar -->
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
+    <button class="btn bc" onclick="saveCfg()">💾 Save Config</button>
+    <button class="btn bgr" onclick="setWebhook()">🔗 Set Webhook</button>
+    <button class="btn bgr" onclick="removeWebhook()">❌ Remove Webhook</button>
+    <button class="btn bgr" onclick="testRbLogin()">🔑 Test RB Login</button>
+    <button class="btn bgr" onclick="testBank()">🏦 Test Bank/UPI</button>
+    <button class="btn bg" onclick="sendTest()">📨 Test Message</button>
+    <button class="btn brb" onclick="testScreenshot()">📸 Test Screenshot</button>
+    <button class="btn bgr" onclick="loadUsers()">📋 Deposit Logs</button>
+    <button class="btn br" onclick="loadBlocked()">🚫 Blocked Users</button>
+    <button class="btn bgr" onclick="loadLogs()">📋 All Logs</button>
+  </div>
+
+  <!-- Screenshot Test Box -->
+  <div class="card" id="ss-test-card" style="display:none">
+    <h2>📸 Screenshot Test</h2>
+    <div class="row">
+      <div class="f1"><label>URL to screenshot</label><input type="text" id="ss-url" value="https://rockybook.vip" placeholder="https://rockybook.vip"></div>
+      <div style="width:200px"><label>Send to Chat ID</label><input type="text" id="ss-chat" placeholder="Admin chat ID"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn brb" onclick="doTestScreenshot()">📸 Take & Send Screenshot</button>
+      <span id="ss-status" style="line-height:34px;font-size:12px;color:var(--td)"></span>
+    </div>
+    <div id="ss-result" style="margin-top:10px;font-size:12px;display:none;background:var(--s2);padding:10px;border-radius:6px;word-break:break-all"></div>
+  </div>
+
+  <!-- Config -->
+  <div class="card">
+    <h2>⚙️ Bot Configuration</h2>
+    <div class="row">
+      <div class="f1"><label>🤖 Telegram Bot Token</label><input type="password" id="cfg-token" placeholder="123456789:ABCdef..."></div>
+      <div class="f1"><label>👑 Admin Chat ID (notifications ke liye)</label><input type="text" id="cfg-admin-chat" placeholder="-100xxxx ya apna personal ID"></div>
+    </div>
+
+    <div style="background:rgba(255,107,26,.07);border:1px solid rgba(255,107,26,.25);border-radius:8px;padding:12px;margin-bottom:10px">
+      <div style="color:var(--rb);font-size:12px;font-weight:700;margin-bottom:8px">🎯 Rebel B2W Account (Admin)</div>
+      <div class="row">
+        <div class="f1"><label>👤 Username / Phone (loginType)</label><input type="text" id="cfg-rbphone" placeholder="username or phone"></div>
+        <div class="f1"><label>🔒 Password</label><input type="password" id="cfg-rbpass" placeholder="Account password"></div>
+      </div>
+      <div class="row">
+        <div class="f1"><label>🌿 Branch Name</label><input type="text" id="cfg-branch" placeholder="RBVIP1D"></div>
+        <div class="f1"><label>🏦 Bank ID (for UPI details)</label><input type="text" id="cfg-bankid" placeholder="69ca38e87f96dde534afef82"></div>
+      </div>
+      <div style="background:rgba(57,255,20,.07);border:1px solid rgba(57,255,20,.25);border-radius:6px;padding:10px;font-size:12px;color:var(--g)">
+        🔒 <b>Hardcoded Deposit User:</b> <code>@Ujjwal0999</code> — All deposit transactions will be created on this account.
+      </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div style="width:150px"><label>💰 Min Deposit (₹)</label><input type="number" id="cfg-minDep" placeholder="500" min="100"></div>
+      <div style="width:150px"><label>💰 Max Deposit (₹)</label><input type="number" id="cfg-maxDep" placeholder="100000" min="500"></div>
+    </div>
+    <div class="row">
+      <div class="f1"><label>👋 Welcome Message (\n for newline)</label><textarea id="cfg-welcome" rows="3"></textarea></div>
+    </div>
+    <div class="row">
+      <div class="f1"><label>✅ Deposit Thanks Message (\n for newline)</label><textarea id="cfg-thanks" rows="2"></textarea></div>
+    </div>
+    <div class="row">
+      <div class="f1"><label>🔒 Change Admin Password (min 4 chars)</label><input type="password" id="cfg-newpass" placeholder="Leave blank to keep current"></div>
+    </div>
+    <div class="flex-end">
+      <button class="btn bc" onclick="saveCfg()">💾 Save Config</button>
+    </div>
+  </div>
+
+  <!-- Linked Users -->
+  <div class="card" id="users-card" style="display:none">
+    <h2>👥 Linked Users</h2>
+    <div id="users-body"></div>
+  </div>
+
+  <!-- Logs -->
+  <div class="card">
+    <h2>📋 Logs</h2>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button class="btn bgr bsm" onclick="loadLogs()">🔄 Refresh</button>
+      <button class="btn bor bsm" onclick="clearLogs()">🗑️ Clear</button>
+    </div>
+    <div class="log-box" id="log-box"><div style="color:var(--td)">Loading...</div></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function g(id){ return document.getElementById(id); }
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function toast(msg,type='info'){
+  const t=g('toast');t.textContent=msg;
+  t.style.borderColor=type==='success'?'var(--g)':type==='error'?'var(--r)':'var(--c)';
+  t.style.color=type==='success'?'var(--g)':type==='error'?'var(--r)':'var(--c)';
+  t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3500);
+}
+async function api(action,payload={}){
+  const opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)};
+  return await fetch('?api_action='+action,opts).then(x=>x.json()).catch(e=>({ok:false,error:String(e)}));
+}
+
+async function loadConfig(){
+  const r=await fetch('?api_action=get_config').then(x=>x.json());
+  if(!r.ok) return;
+  const d=r.data||{};
+  g('cfg-token').value=d.bot_token||'';
+  g('cfg-admin-chat').value=d.admin_chat_id||'';
+  g('cfg-rbphone').value=d.rb_phone||'';
+  g('cfg-rbpass').value=d.rb_password||'';
+  g('cfg-branch').value=d.rb_branch||'RBVIP1D';
+  g('cfg-bankid').value=d.rb_bank_id||'69ca38e87f96dde534afef82';
+  g('cfg-minDep').value=d.min_deposit||500;
+  g('cfg-maxDep').value=d.max_deposit||100000;
+  g('cfg-welcome').value=d.welcome_msg||'';
+  g('cfg-thanks').value=d.deposit_thanks||'';
+}
+
+async function saveCfg(){
+  const payload={
+    bot_token:      g('cfg-token').value.trim(),
+    admin_chat_id:  g('cfg-admin-chat').value.trim(),
+    rb_phone:       g('cfg-rbphone').value.trim(),
+    rb_password:    g('cfg-rbpass').value.trim(),
+    rb_branch:      g('cfg-branch').value.trim()||'RBVIP1D',
+    rb_bank_id:     g('cfg-bankid').value.trim(),
+    min_deposit:    parseInt(g('cfg-minDep').value)||500,
+    max_deposit:    parseInt(g('cfg-maxDep').value)||100000,
+    welcome_msg:    g('cfg-welcome').value,
+    deposit_thanks: g('cfg-thanks').value,
+    new_pass:       g('cfg-newpass').value.trim(),
+  };
+  const r=await api('save_config',payload);
+  r.ok ? toast('✅ Config saved!','success') : toast('Error: '+(r.error||''),'error');
+}
+
+async function setWebhook(){
+  toast('Setting webhook...','info');
+  const r=await api('set_webhook');
+  r.ok ? toast('✅ Webhook set: '+r.webhook_url,'success') : toast('❌ '+( r.error||r.tg?.description||'failed'),'error');
+}
+async function removeWebhook(){
+  const r=await api('remove_webhook');
+  r.ok ? toast('Webhook removed','info') : toast('Error','error');
+}
+
+async function testRbLogin(){
+  toast('Testing Rebel B2W login...','info');
+  const r=await api('test_rb_login');
+  if(r.ok){ const u=r.user||{}; toast('✅ Login OK! '+( u.clientName||JSON.stringify(u).slice(0,60)),'success'); }
+  else toast('❌ '+( r.error||'Login failed'),'error');
+}
+
+async function testBank(){
+  toast('Fetching bank details from PowerDreams...','info');
+  const r=await api('test_bank');
+  const card=g('users-card');
+  const body=g('users-body');
+  card.style.display='block';
+  if(r.ok && r.bank){
+    const b=r.bank;
+    toast('✅ Bank details found!','success');
+    body.innerHTML=`<div style="font-size:13px;line-height:2.2">
+      <b style="color:var(--g)">✅ Bank Details (powerdreams.co payment page):</b><br>
+      📱 UPI ID: <code>${esc(b.upiId||'—')}</code><br>
+      👤 Holder: <b>${esc(b.accHolderName||'—')}</b><br>
+      🔢 Acc No: <code>${esc(b.accNo||'—')}</code><br>
+      🏛 IFSC: <code>${esc(b.ifscCode||'—')}</code><br>
+      🏦 Bank: ${esc(b.bankName||'—')}
+    </div>`;
+  } else {
+    toast('❌ Bank details not found','error');
+    body.innerHTML=`<div style="color:var(--r)">❌ fetchAvailablePeer failed<br><pre style="font-size:10px;margin-top:8px;color:var(--td)">${esc(JSON.stringify(r,null,2))}</pre></div>`;
+  }
+}
+
+async function loadBlocked(){
+  const r=await api('get_blocked_users');
+  const card=g('users-card');
+  const body=g('users-body');
+  card.style.display='block';
+  if(!r.ok||!Object.keys(r.blocked||{}).length){
+    body.innerHTML='<div style="color:var(--g)">✅ No blocked users right now.</div>';
+    return;
+  }
+  let rows='';
+  Object.entries(r.blocked).forEach(([cid,info])=>{
+    rows+=`<tr>
+      <td class="mono">${esc(cid)}</td>
+      <td style="color:var(--r)">${info.remaining_mins} min remaining</td>
+      <td><button class="btn bg bsm" onclick="unblockUser('${esc(cid)}')">✅ Unblock</button></td>
+    </tr>`;
+  });
+  body.innerHTML=`<div style="margin-bottom:8px;color:var(--r)">🚫 <b>Blocked Users: ${r.total}</b></div>`
+    +`<table class="user-table"><thead><tr><th>Chat ID</th><th>Block Time Left</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function unblockUser(chatId){
+  const r=await api('unblock_user',{chat_id:chatId});
+  r.ok ? toast('✅ User unblocked: '+chatId,'success') : toast('Error: '+(r.error||''),'error');
+  loadBlocked();
+}
+
+async function testScreenshot(){
+  const card=g('ss-test-card');
+  card.style.display=card.style.display==='none'?'block':'none';
+  if(card.style.display==='block'){
+    g('ss-chat').value=g('cfg-admin-chat').value||'';
+  }
+}
+
+async function doTestScreenshot(){
+  const url=g('ss-url').value.trim();
+  const chat=g('ss-chat').value.trim();
+  if(!url||!chat){toast('URL aur Chat ID dono chahiye','error');return;}
+  const st=g('ss-status');const res=g('ss-result');
+  st.textContent='⏳ Taking screenshot (may take 30-40 sec)....';
+  st.style.color='var(--y)';
+  res.style.display='none';
+  const r=await api('test_screenshot',{url,chat_id:chat});
+  if(r.ok){
+    st.textContent='✅ Screenshot sent! Source: '+(r.source||'?');
+    st.style.color='var(--g)';
+    toast('✅ Screenshot send ho gayi!','success');
+  } else {
+    st.textContent='❌ Failed: '+(r.error||'unknown');
+    st.style.color='var(--r)';
+    toast('❌ Screenshot fail — '+( r.error||''),'error');
+    res.style.display='block';
+    res.innerHTML='<b style="color:var(--r)">Error:</b> '+esc(r.error||'')+
+      (r.source?'<br>Source tried: '+esc(r.source):'');
+  }
+}
+
+async function sendTest(){
+  toast('Sending test message...','info');
+  const r=await api('send_test',{chat_id:g('cfg-admin-chat').value.trim()});
+  r.ok ? toast('✅ Message sent!','success') : toast('❌ '+(r.error||'failed'),'error');
+}
+
+async function loadUsers(){
+  const r=await api('get_deposit_logs');
+  const card=g('users-card');
+  const body=g('users-body');
+  card.style.display='block';
+  if(!r.ok||!r.data?.length){body.innerHTML='<div style="color:var(--td)">Koi deposit log nahi abhi tak.</div>';return;}
+  let rows='';
+  r.data.forEach(l=>{
+    const d=new Date(l.time).toLocaleString();
+    const cls=l.type==='success'?'log-ok':l.type==='error'?'log-err':'log-info';
+    rows+=`<tr><td style="color:var(--td);font-size:11px">${d}</td><td class="${cls}">${esc(l.text)}</td></tr>`;
+  });
+  body.innerHTML=`<div style="margin-bottom:8px;font-size:12px;color:var(--td)">Deposit & UTR logs: <b>${r.count}</b></div>`
+    +`<table class="user-table"><thead><tr><th>Time</th><th>Log</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function loadLogs(){
+  const r=await fetch('?api_action=get_logs').then(x=>x.json());
+  const box=g('log-box');
+  if(!r.ok||!r.data?.length){box.innerHTML='<div style="color:var(--tf)">No logs yet.</div>';return;}
+  box.innerHTML=r.data.map(l=>{
+    const cls=l.type==='success'?'log-ok':l.type==='error'?'log-err':'log-info';
+    return `<div class="log-entry ${cls}">[${new Date(l.time).toLocaleTimeString()}] ${esc(l.text)}</div>`;
+  }).join('');
+}
+
+async function clearLogs(){
+  await api('clear_logs');
+  loadLogs();
+  toast('Logs cleared','info');
+}
+
+loadConfig();
+loadLogs();
+</script>
+</body>
+</html>
