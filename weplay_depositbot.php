@@ -3,8 +3,8 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║          REBEL WEPLAY DEPOSIT BOT                               ║
  * ║  Telegram bot — users /Deposit karke WePlay ID + amount dete    ║
- * ║  hain, UPI QR/details bot pe milte hain, UTR/screenshot admin   ║
- * ║  verify karta hai.                                              ║
+ * ║  hain, payment details bot pe milte hain, admin dashboard se     ║
+ * ║  payment verify karta hai.                                       ║
  * ╚══════════════════════════════════════════════════════════════════╝
  *
  * Setup:
@@ -151,14 +151,13 @@ function wpbLedgerUser($chatId) {
     return $ledger[(string)$chatId] ?? ['chat_id' => $chatId, 'balance' => 0, 'deposits' => [], 'withdrawals' => []];
 }
 
-function wpbLedgerDeposit($chatId, $amount, $utr, $txnId, $weplayId) {
+function wpbLedgerDeposit($chatId, $amount, $txnId, $weplayId) {
     $ledger = wpbJsonLoad(WPB_LEDGER_FILE);
     $key = (string)$chatId;
     if (!isset($ledger[$key])) $ledger[$key] = ['chat_id' => $chatId, 'balance' => 0, 'deposits' => [], 'withdrawals' => []];
     $ledger[$key]['balance'] += (float)$amount;
     $ledger[$key]['deposits'][] = [
         'amount' => (float)$amount,
-        'utr' => $utr,
         'txn_id' => $txnId,
         'weplay_id' => $weplayId,
         'status' => 'approved',
@@ -340,7 +339,7 @@ function wpbShowPaymentSection($cfg, $chatId, $token) {
         . "Linked WePlay ID: <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
         . "💳 Credit/debit card payment ke liye neeche official secure page open karo.\n"
         . htmlspecialchars($cfg['card_notice'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n\n"
-        . "Payment complete hone ke baad success screenshot/UTR bot me bhej sakte ho ya /Deposit se request create kar sakte ho.";
+        . "Payment complete hone ke baad admin payment dashboard me verify karega.";
     tgSend($token, $chatId, $msg, wpbPaymentKeyboard($cfg));
 }
 
@@ -467,11 +466,12 @@ function wpbHandleText($cfg, $msg) {
             'user_name' => wpbUserName($msg),
             'weplay_id' => $data['weplay_id'] ?? '',
             'amount' => $amount,
-            'status' => 'awaiting_proof',
+            'status' => 'pending_verification',
             'created_at' => date('c'),
         ];
         wpbPendingSave($txnId, $pending);
-        wpbSetState($chatId, 'await_proof', $pending);
+        wpbClearState($chatId);
+        wpbDepositCompleted($chatId);
         $keyboard = ['inline_keyboard' => [[
             ['text' => '🌐 Open WePlay Recharge', 'url' => $cfg['weplay_recharge']],
         ]]];
@@ -480,23 +480,11 @@ function wpbHandleText($cfg, $msg) {
             . "💵 Amount: <b>₹" . number_format($amount, 2) . "</b>\n"
             . "🧾 Transaction ID: <code>{$txnId}</code>\n\n"
             . "UPI: <code>" . htmlspecialchars($cfg['upi_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-            . "Payment ke baad UTR number ya screenshot bhejo.";
+            . "Payment complete hone ke baad admin verify karega.";
         tgSendPhoto($token, $chatId, $qrFile, $caption, $keyboard);
-        wpbLog("Deposit QR sent txn={$txnId} chat={$chatId} amount={$amount}", 'success');
-        return;
-    }
-
-    if ($s === 'await_proof') {
-        if (mb_strlen($text) < 6) {
-            tgSend($token, $chatId, "UTR/transaction reference valid nahi lag raha. Screenshot ya proper UTR bhejo.");
-            return;
-        }
-        $txnId = $data['txn_id'] ?? '';
-        wpbPendingUpdate($txnId, ['utr' => $text, 'status' => 'submitted', 'submitted_at' => date('c')]);
-        wpbClearState($chatId);
-        wpbDepositCompleted($chatId);
         tgSend($token, $chatId, $cfg['deposit_thanks']);
-        wpbNotifyAdmin($cfg, $txnId, 'UTR: ' . $text);
+        wpbNotifyAdmin($cfg, $txnId);
+        wpbLog("Deposit QR sent txn={$txnId} chat={$chatId} amount={$amount}", 'success');
         return;
     }
 
@@ -523,7 +511,7 @@ function wpbHandleText($cfg, $msg) {
     }
 }
 
-function wpbNotifyAdmin($cfg, $txnId, $proofText = '') {
+function wpbNotifyAdmin($cfg, $txnId) {
     $token = trim($cfg['bot_token'] ?? '');
     $admin = trim($cfg['admin_chat_id'] ?? '');
     $p = wpbPendingGet($txnId);
@@ -534,36 +522,9 @@ function wpbNotifyAdmin($cfg, $txnId, $proofText = '') {
         . "Chat ID: <code>" . htmlspecialchars((string)$p['chat_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . "WePlay ID: <code>" . htmlspecialchars($p['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . "Amount: <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n"
-        . ($proofText ? "\nProof: <code>" . htmlspecialchars($proofText, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
-        . "\nRecharge link: " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
+        . "\nVerify payment from WePlay/payment dashboard, then approve or reject.\n"
+        . "Recharge link: " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
     tgSend($token, $admin, $msg, wpbAdminButtons($txnId));
-}
-
-function wpbHandlePhotoProof($cfg, $msg) {
-    $token = trim($cfg['bot_token'] ?? '');
-    $chatId = $msg['chat']['id'] ?? '';
-    $state = wpbGetState($chatId);
-    if (!$state || ($state['state'] ?? '') !== 'await_proof') return false;
-    $data = $state['data'] ?? [];
-    $txnId = $data['txn_id'] ?? '';
-    $caption = trim($msg['caption'] ?? '');
-    $photos = $msg['photo'] ?? [];
-    $bestPhoto = is_array($photos) && $photos ? $photos[count($photos) - 1] : [];
-    $photoFileId = $bestPhoto['file_id'] ?? '';
-    wpbPendingUpdate($txnId, ['photo_file_id' => $photoFileId, 'utr' => $caption, 'status' => 'submitted', 'submitted_at' => date('c')]);
-    wpbClearState($chatId);
-    wpbDepositCompleted($chatId);
-    tgSend($token, $chatId, $cfg['deposit_thanks']);
-    wpbNotifyAdmin($cfg, $txnId, $caption ? ('caption: ' . $caption) : 'screenshot received');
-    if (!empty($cfg['admin_chat_id']) && $photoFileId) {
-        tg('sendPhoto', [
-            'chat_id' => $cfg['admin_chat_id'],
-            'photo' => $photoFileId,
-            'caption' => "Screenshot proof for <code>{$txnId}</code>",
-            'parse_mode' => 'HTML',
-        ], $token);
-    }
-    return true;
 }
 
 function wpbHandleCallback($cfg, $cb) {
@@ -590,7 +551,7 @@ function wpbHandleCallback($cfg, $cb) {
     }
     if ($action === 'approve') {
         wpbPendingUpdate($txnId, ['status' => 'approved', 'approved_at' => date('c')]);
-        wpbLedgerDeposit($p['chat_id'], $p['amount'], $p['utr'] ?? '', $txnId, $p['weplay_id'] ?? '');
+        wpbLedgerDeposit($p['chat_id'], $p['amount'], $txnId, $p['weplay_id'] ?? '');
         tgSend($token, $p['chat_id'], "✅ <b>Deposit Approved!</b>\n\nAmount: <b>₹" . number_format((float)$p['amount'], 2) . "</b>\nTxn: <code>{$txnId}</code>");
         tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Approved'], $token);
         wpbLog("Approved txn={$txnId}", 'success');
@@ -614,9 +575,6 @@ if (isset($_GET['webhook'])) {
     } else {
         $msg = $update['message'] ?? $update['channel_post'] ?? null;
         if ($msg) {
-            if (!empty($msg['photo']) && wpbHandlePhotoProof($cfg, $msg)) {
-                http_response_code(200); exit;
-            }
             wpbHandleText($cfg, $msg);
         }
     }
