@@ -47,7 +47,7 @@ $defaultConfig = [
     'weplay_site'          => 'https://weplayapp.com',
     'weplay_recharge'      => 'https://weplayapp.com/recharge/?region=C',
     'support_contact'      => '@Rebel_babyyy',
-    'welcome_msg'          => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id &lt;your-id&gt; — Link your WePlay ID &amp; open recharge</b>\n<b>💰 /Deposit — Create a deposit request</b>\n<b>💳 /pay — Open the secure payment section</b>\n<b>💸 /Withdrawal — Create a withdrawal request</b>\n<b>💳 /Balance — Check your balance</b>\n<b>💾 /save — Save a card for auto-charge</b>\n<b>🗂 /mycards — View &amp; manage all saved cards</b>\n<b>⚡ /autocharge — Manage auto-charge settings</b>\n<b>❓ /Help — Show help</b>",
+    'welcome_msg'          => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id &lt;your-id&gt; — WePlay ID link karo</b>\n<b>💳 /pay — Coins kharido (auto-charge)</b>\n<b>💾 /save — Card save karo auto-charge ke liye</b>\n<b>🗂 /mycards — Apne saved cards dekho</b>\n<b>⚡ /autocharge — Auto-charge manage karo</b>\n<b>❓ /Help — Help</b>",
     'deposit_thanks'       => "✅ <b>Deposit submitted!</b>\n\n<b>The admin will verify the payment and credit your WePlay account.</b>",
     'card_notice'          => "🔐 <b>Do not send card details in this bot. Enter card number/CVV only on the official WePlay/payment gateway page.</b>",
     // Razorpay credentials — fill via admin panel
@@ -622,18 +622,47 @@ function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
 function wpbShowPaymentSection($cfg, $chatId, $token) {
     $profile = wpbGetProfile($chatId);
     if (empty($profile['weplay_id'])) {
-        wpbSetState($chatId, 'await_link_id', []);
-        tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username first.</b>\n\n<b>Example:</b> <code>12345678</code>\n<b>Send /cancel to cancel.</b>");
+        wpbSetState($chatId, 'await_link_id', ['next' => 'pay']);
+        tgSend($token, $chatId,
+            "🆔 <b>WePlay ID link karo pehle.</b>\n\n"
+            . "<b>Apna WePlay User ID bhejo:</b>\n<b>Example:</b> <code>12345678</code>\n<b>/cancel to cancel.</b>"
+        );
         return;
     }
+    wpbShowCoinPackagesForPay($cfg, $chatId, $token, $profile['weplay_id']);
+}
 
-    $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
-    $msg = "🎮 <b>WePlay Payment Section</b>\n\n"
-        . "<b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-        . "<b>💳 For credit/debit card payment, open the official secure page below.</b>\n"
-        . $cardNotice . "\n\n"
-        . "<b>After payment is completed, the admin will verify it in the payment dashboard.</b>";
-    tgSend($token, $chatId, $msg, wpbPaymentKeyboard($cfg));
+function wpbShowCoinPackagesForPay($cfg, $chatId, $token, $weplayId) {
+    $packages = $cfg['coin_packages'] ?? [];
+    $saved    = wpbGetDefaultCard($chatId);
+    $acOn     = $saved && !empty($saved['autocharge']);
+    $l4       = ($saved && $saved['last4']) ? ' •••• ' . $saved['last4'] : '';
+    $net      = ($saved && $saved['network']) ? ' (' . $saved['network'] . ')' : '';
+
+    $rows = [];
+    $row  = [];
+    foreach ($packages as $i => $pkg) {
+        $row[] = ['text' => $pkg['label'], 'callback_data' => 'pay_pkg:' . $i];
+        if (count($row) === 2) { $rows[] = $row; $row = []; }
+    }
+    if ($row) $rows[] = $row;
+
+    $rechargeUrl = $cfg['weplay_recharge'] ?? '';
+    if ($rechargeUrl) {
+        $rows[] = [['text' => '🌐 Open WePlay Recharge Page', 'url' => $rechargeUrl]];
+    }
+
+    $cardLine = $acOn
+        ? "\n⚡ <b>Auto-charge ON</b> — Card{$l4}{$net}"
+        : "\n💡 <b>Card nahi save hai.</b> Use /save to add card for auto-charge.";
+
+    tgSend($token, $chatId,
+        "🎮 <b>WePlay Recharge</b>\n\n"
+        . "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>"
+        . $cardLine . "\n\n"
+        . "🛒 <b>Coin package select karo:</b>",
+        ['inline_keyboard' => $rows]
+    );
 }
 
 function wpbBuildCallbackUrl() {
@@ -702,12 +731,14 @@ function rzpTokeniseCard($cfg, $chatId, array $data) {
 }
 
 function wpbHandleSaveCardStart($cfg, $chatId, $token) {
-    wpbSetState($chatId, 'save_card_number', []);
+    wpbSetState($chatId, 'save_card_oneline', []);
     tgSend($token, $chatId,
-        "💳 <b>Save a Card for Auto-Charge</b>\n\n"
-        . "🔐 <b>Your card details are used only for tokenisation and are never stored permanently.</b>\n\n"
-        . "<b>Step 1/4 — Enter your card number</b> (digits only):\n<b>Example:</b> <code>4111111111111111</code>\n\n"
-        . "<b>Send /cancel to cancel at any time.</b>"
+        "💳 <b>Card Save karo</b>\n\n"
+        . "🔐 <b>Card details sirf tokenise karne ke liye use hoti hain — disk pe store nahi hoti.</b>\n\n"
+        . "<b>Is format mein card details bhejo:</b>\n\n"
+        . "<code>CARDNUMBER|MM|YYYY|CVV</code>\n\n"
+        . "<b>Example:</b>\n<code>5430139926528329|06|2028|082</code>\n\n"
+        . "<b>/cancel to cancel.</b>"
     );
 }
 
@@ -804,15 +835,12 @@ function wpbHandleText($cfg, $msg) {
     if (strcasecmp($text, '/help') === 0) {
         tgSend($token, $chatId,
             "❓ <b>Help</b>\n\n"
-            . "<b>/id — Link your WePlay ID and open the payment section</b>\n"
-            . "<b>/pay — Open the secure WePlay payment page</b>\n"
-            . "<b>/Deposit — Create a deposit request</b>\n"
-            . "<b>/Withdrawal — Create a withdrawal request</b>\n"
-            . "<b>/Balance — Check your local balance</b>\n"
-            . "<b>/save — Add a card for one-click auto-charge</b>\n"
-            . "<b>/mycards — View and manage all your saved cards</b>\n"
-            . "<b>/autocharge — Enable/disable auto-charge on default card</b>\n"
-            . "<b>/cancel — Cancel the current process</b>\n\n"
+            . "<b>/id — WePlay ID link karo</b>\n"
+            . "<b>/pay — Coins select karo aur pay karo</b>\n"
+            . "<b>/save — Card save karo (format: NUMBER|MM|YYYY|CVV)</b>\n"
+            . "<b>/mycards — Saare saved cards dekho</b>\n"
+            . "<b>/autocharge — Auto-charge on/off karo</b>\n"
+            . "<b>/cancel — Current process cancel karo</b>\n\n"
             . "<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8')
         );
         return;
@@ -873,7 +901,7 @@ function wpbHandleText($cfg, $msg) {
     }
 
     if (!$state) {
-        tgSend($token, $chatId, "❓ <b>Command not recognized. Please use /Deposit, /Withdrawal, /Balance, /id, /pay, /save, /autocharge, or /Help.</b>");
+        tgSend($token, $chatId, "❓ <b>Command samajh nahi aaya.</b>\n\n<b>/pay — Coins kharido</b>\n<b>/save — Card save karo</b>\n<b>/mycards — Cards dekho</b>\n<b>/autocharge — Auto-charge</b>\n<b>/help — Help</b>");
         return;
     }
 
@@ -897,8 +925,14 @@ function wpbHandleText($cfg, $msg) {
         }
         wpbSaveProfile($chatId, $text, wpbUserName($msg));
         wpbClearState($chatId);
-        tgSend($token, $chatId, "✅ <b>WePlay ID linked:</b> <code>" . htmlspecialchars($text, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>Opening recharge page…</b>");
-        wpbShowCoinPackages($cfg, $chatId, $token, $text);
+        tgSend($token, $chatId, "✅ <b>WePlay ID linked:</b> <code>" . htmlspecialchars($text, ENT_NOQUOTES, 'UTF-8') . "</code>");
+        // If came from /pay flow, show coin packages for pay
+        $next = $data['next'] ?? '';
+        if ($next === 'pay') {
+            wpbShowCoinPackagesForPay($cfg, $chatId, $token, $text);
+        } else {
+            wpbShowCoinPackages($cfg, $chatId, $token, $text);
+        }
         return;
     }
 
@@ -1046,113 +1080,108 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
 
-    // ── /save multi-step card entry states ────────────────────────────────────
-    if ($s === 'save_card_number') {
-        $raw = preg_replace('/\D/', '', $text);
-        if (strlen($raw) < 13 || strlen($raw) > 19) {
-            tgSend($token, $chatId, "❌ <b>Invalid card number.</b> Please enter a valid 13–19 digit card number.\n<b>Send /cancel to cancel.</b>");
+    // ── /save single-line card entry: CARDNUMBER|MM|YYYY|CVV ─────────────────
+    if ($s === 'save_card_oneline') {
+        // Accept format: 5430139926528329|06|2028|082
+        $parts = explode('|', trim($text));
+        if (count($parts) !== 4) {
+            tgSend($token, $chatId,
+                "❌ <b>Format galat hai.</b>\n\n"
+                . "<b>Sahi format:</b> <code>CARDNUMBER|MM|YYYY|CVV</code>\n"
+                . "<b>Example:</b> <code>5430139926528329|06|2028|082</code>\n\n"
+                . "<b>/cancel to cancel.</b>"
+            );
             return;
         }
-        $last4 = substr($raw, -4);
-        $data['card_number'] = $raw;
-        $data['last4']       = $last4;
-        wpbSetState($chatId, 'save_card_expiry', $data);
-        tgSend($token, $chatId,
-            "✅ Card ending in <b>{$last4}</b> noted.\n\n"
-            . "📅 <b>Enter expiry date</b> (MM/YY or MM/YYYY):\n<b>Example:</b> <code>08/27</code>\n<b>Send /cancel to cancel.</b>"
-        );
-        return;
-    }
+        $cardNum = preg_replace('/\D/', '', trim($parts[0]));
+        $month   = trim($parts[1]);
+        $year    = trim($parts[2]);
+        $cvv     = trim($parts[3]);
 
-    if ($s === 'save_card_expiry') {
-        if (!preg_match('/^(0[1-9]|1[0-2])\/?(\d{2}|\d{4})$/', trim($text), $em)) {
-            tgSend($token, $chatId, "❌ <b>Invalid expiry.</b> Format: MM/YY — e.g. <code>08/27</code>\n<b>Send /cancel to cancel.</b>");
-            return;
+        $errMsg = '';
+        if (strlen($cardNum) < 13 || strlen($cardNum) > 19) {
+            $errMsg = 'Card number invalid (13–19 digits chahiye).';
+        } elseif (!preg_match('/^(0[1-9]|1[0-2])$/', $month)) {
+            $errMsg = 'MM invalid (01–12 hona chahiye).';
+        } elseif (!preg_match('/^\d{4}$/', $year) || (int)$year < date('Y')) {
+            $errMsg = 'YYYY invalid ya card expire ho gaya.';
+        } elseif (!preg_match('/^\d{3,4}$/', $cvv)) {
+            $errMsg = 'CVV invalid (3–4 digits chahiye).';
         }
-        $month = $em[1];
-        $year  = strlen($em[2]) === 2 ? '20' . $em[2] : $em[2];
-        $data['expiry_month'] = $month;
-        $data['expiry_year']  = $year;
-        wpbSetState($chatId, 'save_card_cvv', $data);
-        tgSend($token, $chatId,
-            "✅ Expiry noted.\n\n"
-            . "🔒 <b>Enter CVV</b> (3 or 4 digits):\n\n"
-            . "⚠️ <b>Note:</b> CVV is used only for tokenisation and is NOT stored permanently.\n<b>Send /cancel to cancel.</b>"
-        );
-        return;
-    }
 
-    if ($s === 'save_card_cvv') {
-        $cvv = trim($text);
-        if (!preg_match('/^\d{3,4}$/', $cvv)) {
-            tgSend($token, $chatId, "❌ <b>Invalid CVV.</b> Enter 3 or 4 digits.\n<b>Send /cancel to cancel.</b>");
+        if ($errMsg) {
+            tgSend($token, $chatId,
+                "❌ <b>{$errMsg}</b>\n\n"
+                . "<b>Format:</b> <code>CARDNUMBER|MM|YYYY|CVV</code>\n"
+                . "<b>Example:</b> <code>5430139926528329|06|2028|082</code>"
+            );
             return;
         }
-        $data['cvv'] = $cvv;
-        wpbSetState($chatId, 'save_card_name', $data);
-        tgSend($token, $chatId,
-            "✅ CVV noted.\n\n"
-            . "👤 <b>Enter cardholder name</b> (as printed on card):\n<b>Example:</b> <code>RAHUL SHARMA</code>\n<b>Send /cancel to cancel.</b>"
-        );
-        return;
-    }
 
-    if ($s === 'save_card_name') {
-        $name = trim($text);
-        if (mb_strlen($name) < 2) {
-            tgSend($token, $chatId, "❌ <b>Please enter a valid name.</b>");
-            return;
-        }
-        $data['holder_name'] = strtoupper($name);
+        $last4 = substr($cardNum, -4);
+        // Detect network
+        if (str_starts_with($cardNum, '4'))        $network = 'Visa';
+        elseif (preg_match('/^5[1-5]/', $cardNum)) $network = 'Mastercard';
+        elseif (preg_match('/^3[47]/', $cardNum))  $network = 'Amex';
+        elseif (preg_match('/^6/', $cardNum))      $network = 'RuPay';
+        else                                        $network = 'Card';
+
+        $cardData = [
+            'card_number'  => $cardNum,
+            'last4'        => $last4,
+            'expiry_month' => $month,
+            'expiry_year'  => $year,
+            'cvv'          => $cvv,
+            'holder_name'  => '',
+        ];
+
         wpbClearState($chatId);
 
-        // Detect card network from first digit
-        $num = $data['card_number'] ?? '';
-        if (str_starts_with($num, '4'))       $network = 'Visa';
-        elseif (preg_match('/^5[1-5]/', $num)) $network = 'Mastercard';
-        elseif (preg_match('/^3[47]/', $num))  $network = 'Amex';
-        elseif (preg_match('/^6/', $num))      $network = 'RuPay/Discover';
-        else                                   $network = 'Card';
-
-        // Try Razorpay tokenisation if credentials present
+        // Try Razorpay tokenisation
         $tokenised = false;
         $custId = '';
         $tokId  = '';
         if (!empty($cfg['razorpay_key_id']) && !empty($cfg['razorpay_key_secret'])) {
-            $rzpTok = rzpTokeniseCard($cfg, $chatId, $data);
+            $rzpTok = rzpTokeniseCard($cfg, $chatId, $cardData);
             if ($rzpTok && !empty($rzpTok['id'])) {
                 $custId    = $rzpTok['customer_id'] ?? '';
                 $tokId     = $rzpTok['id'];
                 $network   = $rzpTok['card']['network'] ?? $network;
-                $last4     = $rzpTok['card']['last4']   ?? $data['last4'];
+                $last4     = $rzpTok['card']['last4']   ?? $last4;
                 $tokenised = true;
             }
         }
 
         $cardEntry = [
-            'type'          => $tokenised ? 'razorpay_token' : 'manual',
-            'customer_id'   => $custId,
-            'token_id'      => $tokId,
-            'last4'         => $data['last4'] ?? '',
-            'network'       => $network,
-            'holder_name'   => $data['holder_name'],
-            'expiry_month'  => $data['expiry_month'] ?? '',
-            'expiry_year'   => $data['expiry_year'] ?? '',
-            'autocharge'    => true,
+            'type'         => $tokenised ? 'razorpay_token' : 'manual',
+            'customer_id'  => $custId,
+            'token_id'     => $tokId,
+            'last4'        => $last4,
+            'network'      => $network,
+            'expiry_month' => $month,
+            'expiry_year'  => $year,
+            'autocharge'   => true,
         ];
-        // Never store raw card number or CVV persistently
-        $idx = wpbAddCard($chatId, $cardEntry);
+        $idx   = wpbAddCard($chatId, $cardEntry);
         $label = wpbCardLabel($cardEntry, $idx);
 
-        wpbLog("Card saved chat={$chatId} last4={$cardEntry['last4']} type={$cardEntry['type']}", 'success');
+        wpbLog("Card saved chat={$chatId} last4={$last4} type={$cardEntry['type']}", 'success');
+
+        $keyboard = ['inline_keyboard' => [
+            [['text' => '⚡ Enable Auto-Charge', 'callback_data' => 'ac_on']],
+            [['text' => '🗂 My Cards', 'callback_data' => 'ac_mycards']],
+        ]];
 
         tgSend($token, $chatId,
-            "✅ <b>Card Saved!</b>\n\n"
+            "✅ <b>Card Save Ho Gaya!</b>\n\n"
             . "<b>{$label}</b>\n"
-            . "<b>Expiry:</b> {$cardEntry['expiry_month']}/{$cardEntry['expiry_year']}\n"
-            . ($tokenised ? "⚡ <b>Razorpay tokenised — auto-charge ready!</b>" : "💾 <b>Saved locally. Auto-charge will use Razorpay when configured.</b>") . "\n\n"
-            . "<b>Use /mycards to view all saved cards.</b>\n"
-            . "<b>Use /autocharge to manage auto-charge.</b>"
+            . "<b>Expiry:</b> {$month}/{$year}\n"
+            . ($tokenised
+                ? "⚡ <b>Razorpay tokenised — auto-charge ready!</b>"
+                : "💾 <b>Locally saved. Razorpay configure hone pe auto-charge activate hoga.</b>"
+            ) . "\n\n"
+            . "<b>Ab /pay karke coin select karo aur ⚡ Auto-Charge dabao!</b>",
+            $keyboard
         );
         return;
     }
@@ -1255,6 +1284,134 @@ function wpbHandleCallback($cfg, $cb) {
         } else {
             tgSend($token, $chatId, "⚠️ <b>No saved card found. Use /save to add a card.</b>");
         }
+        return;
+    }
+
+    // ── /pay flow: coin package selected → pay_pkg:<index> ──────────────────
+    if (preg_match('/^pay_pkg:(\d+)$/', $data, $m)) {
+        $pkgIndex = (int)$m[1];
+        $packages = $cfg['coin_packages'] ?? [];
+        if (!isset($packages[$pkgIndex])) {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Package not found'], $token);
+            return;
+        }
+        $pkg     = $packages[$pkgIndex];
+        $profile = wpbGetProfile($chatId);
+        $weplayId = $profile['weplay_id'] ?? '';
+        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => '✅ Package selected!'], $token);
+
+        $saved = wpbGetDefaultCard($chatId);
+        $acOn  = $saved && !empty($saved['autocharge']);
+        $l4    = ($saved && $saved['last4']) ? ' •••• ' . $saved['last4'] : '';
+        $net   = ($saved && $saved['network']) ? ' (' . $saved['network'] . ')' : '';
+
+        $msg = "🛒 <b>Package Selected</b>\n\n"
+            . "🎮 <b>Coins:</b> " . (int)$pkg['coins'] . " Coins\n"
+            . "💵 <b>Price:</b> ₹" . number_format((float)$pkg['price'], 2) . "\n"
+            . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '') . "\n";
+
+        if ($acOn) {
+            $msg .= "⚡ <b>Auto-charge card{$l4}{$net} se payment hogi.</b>\n\n"
+                . "<b>/autocharge dabao to payment start hogi.</b>";
+            $keyboard = ['inline_keyboard' => [
+                [['text' => '⚡ Auto-Charge Now — ₹' . number_format((float)$pkg['price'], 2), 'callback_data' => 'pay_ac:' . $pkgIndex]],
+                [['text' => '🔄 Change Card', 'callback_data' => 'ac_mycards']],
+            ]];
+        } else {
+            $msg .= "<b>💳 Card save nahi hai auto-charge ke liye.</b>\n\n"
+                . "<b>Use /save to add your card in format:</b>\n"
+                . "<code>CARDNUMBER|MM|YYYY|CVV</code>\n"
+                . "<b>Example:</b> <code>5430139926528329|06|2028|082</code>";
+            $keyboard = ['inline_keyboard' => [
+                [['text' => '💾 Save Card (/save)', 'callback_data' => 'ac_addcard']],
+            ]];
+        }
+        tgSend($token, $chatId, $msg, $keyboard);
+        return;
+    }
+
+    // ── /pay flow: auto-charge triggered from package selection ─────────────
+    if (preg_match('/^pay_ac:(\d+)$/', $data, $m)) {
+        $pkgIndex = (int)$m[1];
+        $packages = $cfg['coin_packages'] ?? [];
+        if (!isset($packages[$pkgIndex])) {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Package not found'], $token);
+            return;
+        }
+        $pkg      = $packages[$pkgIndex];
+        $profile  = wpbGetProfile($chatId);
+        $weplayId = $profile['weplay_id'] ?? '';
+        $saved    = wpbGetDefaultCard($chatId);
+
+        if (!$saved || empty($saved['autocharge'])) {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Auto-charge not enabled', 'show_alert' => true], $token);
+            return;
+        }
+        if (empty($cfg['razorpay_key_id'])) {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Razorpay not configured', 'show_alert' => true], $token);
+            return;
+        }
+
+        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => '⚡ Charging...'], $token);
+
+        $amount = (float)$pkg['price'];
+        $txnId  = 'WP' . date('ymdHis') . mt_rand(100, 999);
+        $l4     = $saved['last4']   ? ' •••• ' . $saved['last4']   : '';
+        $net    = $saved['network'] ? ' (' . $saved['network'] . ')' : '';
+
+        $pendingRec = [
+            'txn_id'         => $txnId,
+            'chat_id'        => $chatId,
+            'user_name'      => ($profile['telegram_name'] ?? ('ID ' . $chatId)),
+            'weplay_id'      => $weplayId,
+            'coins'          => (int)$pkg['coins'],
+            'amount'         => $amount,
+            'payment_method' => 'autocharge',
+            'status'         => 'autocharge_processing',
+            'created_at'     => date('c'),
+        ];
+        wpbPendingSave($txnId, $pendingRec);
+
+        tgSend($token, $chatId,
+            "⚡ <b>Auto-Charging card{$l4}{$net}</b>\n\n"
+            . "🎮 <b>Coins:</b> " . (int)$pkg['coins'] . "\n"
+            . "💵 <b>Amount:</b> ₹" . number_format($amount, 2) . "\n"
+            . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n\n"
+            . "<b>Processing…</b>"
+        );
+
+        $rzpResult = rzpChargeToken($cfg, $saved['customer_id'], $saved['token_id'], $amount, $txnId, $chatId);
+        if ($rzpResult && !empty($rzpResult['razorpay_payment_id'])) {
+            $payId = $rzpResult['razorpay_payment_id'];
+            rzpCapturePayment($cfg, $payId, $amount);
+            wpbPendingUpdate($txnId, ['rzp_payment_id' => $payId, 'status' => 'approved', 'approved_at' => date('c'), 'auto_charged' => true]);
+            wpbLedgerDeposit($chatId, $amount, $txnId, $weplayId);
+            wpbLog("pay_ac approved txn={$txnId} pid={$payId}", 'success');
+            tgSend($token, $chatId,
+                "✅ <b>Payment Successful!</b>\n\n"
+                . "🎮 <b>Coins:</b> " . (int)$pkg['coins'] . "\n"
+                . "💵 <b>Amount:</b> ₹" . number_format($amount, 2) . "\n"
+                . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n"
+                . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
+                . "<b>WePlay account credit hoga jald hi.</b>"
+            );
+        } else {
+            wpbPendingUpdate($txnId, ['status' => 'autocharge_failed', 'failed_at' => date('c')]);
+            wpbLog("pay_ac failed txn={$txnId}", 'error');
+            $fallbackUrl = wpbBuildCallbackUrl();
+            $payLink = rzpCreatePaymentLink($cfg, $txnId, $amount, $chatId, $weplayId, $fallbackUrl);
+            if ($payLink) {
+                wpbPendingUpdate($txnId, ['status' => 'pending_verification', 'rzp_payment_link' => $payLink]);
+                tgSend($token, $chatId,
+                    "⚠️ <b>Auto-charge fail hua.</b> Manually pay karo:\n\n"
+                    . "👉 <a href=\"{$payLink}\">Pay ₹" . number_format($amount, 2) . "</a>",
+                    ['inline_keyboard' => [[['text' => '💳 Pay Now', 'url' => $payLink]]]]
+                );
+            } else {
+                tgSend($token, $chatId, "⚠️ <b>Payment fail.</b> Contact: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+            }
+        }
+        wpbNotifyAdmin($cfg, $txnId);
         return;
     }
 
