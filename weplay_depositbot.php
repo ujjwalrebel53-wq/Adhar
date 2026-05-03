@@ -47,7 +47,7 @@ $defaultConfig = [
     'weplay_site'          => 'https://weplayapp.com',
     'weplay_recharge'      => 'https://weplayapp.com/recharge/?region=C',
     'support_contact'      => '@Rebel_babyyy',
-    'welcome_msg'          => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id &lt;your-id&gt; — Link your WePlay ID &amp; open recharge</b>\n<b>💰 /Deposit — Create a deposit request</b>\n<b>💳 /pay — Open the secure payment section</b>\n<b>💸 /Withdrawal — Create a withdrawal request</b>\n<b>💳 /Balance — Check your balance</b>\n<b>⚡ /autocharge — Manage auto-charge from saved card</b>\n<b>❓ /Help — Show help</b>",
+    'welcome_msg'          => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id &lt;your-id&gt; — Link your WePlay ID &amp; open recharge</b>\n<b>💰 /Deposit — Create a deposit request</b>\n<b>💳 /pay — Open the secure payment section</b>\n<b>💸 /Withdrawal — Create a withdrawal request</b>\n<b>💳 /Balance — Check your balance</b>\n<b>💾 /save — Save a card for auto-charge</b>\n<b>🗂 /mycards — View &amp; manage all saved cards</b>\n<b>⚡ /autocharge — Manage auto-charge settings</b>\n<b>❓ /Help — Show help</b>",
     'deposit_thanks'       => "✅ <b>Deposit submitted!</b>\n\n<b>The admin will verify the payment and credit your WePlay account.</b>",
     'card_notice'          => "🔐 <b>Do not send card details in this bot. Enter card number/CVV only on the official WePlay/payment gateway page.</b>",
     // Razorpay credentials — fill via admin panel
@@ -219,41 +219,136 @@ function rzpVerifyWebhook($rawBody, $signature, $secret) {
     return hash_equals($expected, (string)$signature);
 }
 
-// ─── Saved card / customer token store ───────────────────────────────────────
+// ─── Saved cards store (multiple cards per user) ─────────────────────────────
+// Structure: { "chat_id": { "cards": [ {...}, {...} ], "default_idx": 0 } }
 
-function wpbGetSavedCard($chatId) {
-    $cards = wpbJsonLoad(WPB_CARDS_FILE);
-    return $cards[(string)$chatId] ?? null;
+function wpbGetUserCards($chatId) {
+    $store = wpbJsonLoad(WPB_CARDS_FILE);
+    return $store[(string)$chatId] ?? ['cards' => [], 'default_idx' => 0];
 }
 
+/** Return the default (active) card entry or null */
+function wpbGetDefaultCard($chatId) {
+    $u = wpbGetUserCards($chatId);
+    $cards = $u['cards'] ?? [];
+    if (empty($cards)) return null;
+    $idx = (int)($u['default_idx'] ?? 0);
+    if ($idx >= count($cards)) $idx = 0;
+    return $cards[$idx] ?? null;
+}
+
+/** BC shim used by existing auto-charge code */
+function wpbGetSavedCard($chatId) {
+    return wpbGetDefaultCard($chatId);
+}
+
+/**
+ * Add a new card entry for the user. Accepts raw card data (stored encrypted/masked)
+ * OR a Razorpay customer_id+token_id from webhook.
+ * Returns the index of the newly added card.
+ */
+function wpbAddCard($chatId, array $cardEntry) {
+    $store = wpbJsonLoad(WPB_CARDS_FILE);
+    $key   = (string)$chatId;
+    if (!isset($store[$key])) $store[$key] = ['cards' => [], 'default_idx' => 0];
+    $cardEntry['saved_at'] = date('c');
+    if (!isset($cardEntry['autocharge'])) $cardEntry['autocharge'] = true;
+    $store[$key]['cards'][] = $cardEntry;
+    $newIdx = count($store[$key]['cards']) - 1;
+    // new card becomes default
+    $store[$key]['default_idx'] = $newIdx;
+    wpbJsonSave(WPB_CARDS_FILE, $store, true);
+    return $newIdx;
+}
+
+/** Delete one card by index */
+function wpbDeleteCardByIndex($chatId, $idx) {
+    $store = wpbJsonLoad(WPB_CARDS_FILE);
+    $key   = (string)$chatId;
+    if (!isset($store[$key]['cards'][$idx])) return false;
+    array_splice($store[$key]['cards'], $idx, 1);
+    // fix default_idx
+    $total = count($store[$key]['cards']);
+    if ($total === 0) {
+        unset($store[$key]);
+    } else {
+        $def = (int)$store[$key]['default_idx'];
+        if ($def >= $total) $store[$key]['default_idx'] = $total - 1;
+    }
+    wpbJsonSave(WPB_CARDS_FILE, $store, true);
+    return true;
+}
+
+/** Delete all cards of a user */
+function wpbDeleteSavedCard($chatId) {
+    $store = wpbJsonLoad(WPB_CARDS_FILE);
+    unset($store[(string)$chatId]);
+    wpbJsonSave(WPB_CARDS_FILE, $store, true);
+}
+
+/** Set default card index */
+function wpbSetDefaultCard($chatId, $idx) {
+    $store = wpbJsonLoad(WPB_CARDS_FILE);
+    $key   = (string)$chatId;
+    if (!isset($store[$key]['cards'][$idx])) return false;
+    $store[$key]['default_idx'] = (int)$idx;
+    wpbJsonSave(WPB_CARDS_FILE, $store, true);
+    return true;
+}
+
+/** Toggle autocharge on default card */
+function wpbToggleAutoCharge($chatId, $enabled) {
+    $store = wpbJsonLoad(WPB_CARDS_FILE);
+    $key   = (string)$chatId;
+    if (empty($store[$key]['cards'])) return false;
+    $idx = (int)($store[$key]['default_idx'] ?? 0);
+    if (!isset($store[$key]['cards'][$idx])) return false;
+    $store[$key]['cards'][$idx]['autocharge'] = (bool)$enabled;
+    wpbJsonSave(WPB_CARDS_FILE, $store, true);
+    return true;
+}
+
+/** Toggle autocharge on specific card index */
+function wpbToggleAutoChargeByIdx($chatId, $cardIdx, $enabled) {
+    $store = wpbJsonLoad(WPB_CARDS_FILE);
+    $key   = (string)$chatId;
+    if (!isset($store[$key]['cards'][$cardIdx])) return false;
+    $store[$key]['cards'][$cardIdx]['autocharge'] = (bool)$enabled;
+    wpbJsonSave(WPB_CARDS_FILE, $store, true);
+    return true;
+}
+
+/** BC shim used by existing webhook code */
 function wpbSaveSavedCard($chatId, $customerId, $tokenId, $last4 = '', $network = '') {
-    $cards = wpbJsonLoad(WPB_CARDS_FILE);
-    $cards[(string)$chatId] = [
-        'chat_id'      => $chatId,
+    // Check if token already exists to avoid duplicates
+    $u = wpbGetUserCards($chatId);
+    foreach ($u['cards'] as $c) {
+        if (($c['token_id'] ?? '') === $tokenId) return; // already saved
+    }
+    wpbAddCard($chatId, [
+        'type'         => 'razorpay_token',
         'customer_id'  => $customerId,
         'token_id'     => $tokenId,
         'last4'        => $last4,
         'network'      => $network,
         'autocharge'   => true,
-        'saved_at'     => date('c'),
-    ];
-    wpbJsonSave(WPB_CARDS_FILE, $cards, true);
+    ]);
 }
 
-function wpbDeleteSavedCard($chatId) {
-    $cards = wpbJsonLoad(WPB_CARDS_FILE);
-    unset($cards[(string)$chatId]);
-    wpbJsonSave(WPB_CARDS_FILE, $cards, true);
+/** Mask a card number: keep last 4 digits, mask the rest */
+function wpbMaskCardNumber($num) {
+    $num = preg_replace('/\D/', '', $num);
+    if (strlen($num) < 4) return str_repeat('*', strlen($num));
+    return str_repeat('*', strlen($num) - 4) . substr($num, -4);
 }
 
-function wpbToggleAutoCharge($chatId, $enabled) {
-    $cards = wpbJsonLoad(WPB_CARDS_FILE);
-    if (isset($cards[(string)$chatId])) {
-        $cards[(string)$chatId]['autocharge'] = (bool)$enabled;
-        wpbJsonSave(WPB_CARDS_FILE, $cards, true);
-        return true;
-    }
-    return false;
+/** Card label for display */
+function wpbCardLabel(array $card, $idx) {
+    $num  = $card['last4']   ? '•••• ' . $card['last4']   : '';
+    $net  = $card['network'] ? ' ' . $card['network']      : '';
+    $name = !empty($card['holder_name']) ? ' — ' . $card['holder_name'] : '';
+    $type = ($card['type'] ?? '') === 'razorpay_token' ? '' : ' [manual]';
+    return "💳 Card " . ($idx + 1) . ": {$num}{$net}{$name}{$type}";
 }
 
 function wpbLog($text, $type = 'info') {
@@ -496,15 +591,20 @@ function wpbShowCoinPackages($cfg, $chatId, $token, $weplayId) {
 function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
     wpbSetState($chatId, 'await_amount', ['weplay_id' => $weplayId, 'payment_method' => 'card']);
 
-    // Check if user has a saved card with auto-charge enabled
-    $saved = wpbGetSavedCard($chatId);
+    $u     = wpbGetUserCards($chatId);
+    $cards = $u['cards'] ?? [];
+    $saved = wpbGetDefaultCard($chatId);
     $autoInfo = '';
     if ($saved && !empty($saved['autocharge'])) {
-        $net  = $saved['network'] ? ' (' . htmlspecialchars($saved['network'], ENT_NOQUOTES, 'UTF-8') . ')' : '';
-        $l4   = $saved['last4'] ? ' •••• ' . htmlspecialchars($saved['last4'], ENT_NOQUOTES, 'UTF-8') : '';
-        $autoInfo = "\n\n⚡ <b>Auto-charge active</b> — saved card{$l4}{$net} will be charged automatically.\n<b>To disable:</b> /autocharge";
+        $net   = $saved['network'] ? ' (' . htmlspecialchars($saved['network'], ENT_NOQUOTES, 'UTF-8') . ')' : '';
+        $l4    = $saved['last4']   ? ' •••• ' . htmlspecialchars($saved['last4'], ENT_NOQUOTES, 'UTF-8') : '';
+        $total = count($cards);
+        $more  = $total > 1 ? " (+".($total-1)." more)" : '';
+        $autoInfo = "\n\n⚡ <b>Auto-charge active</b> — Card{$l4}{$net}{$more} will be charged.\n<b>Manage cards:</b> /mycards | /autocharge";
     } elseif ($saved) {
         $autoInfo = "\n\n💳 <b>Saved card available.</b> Use /autocharge to enable auto-charge.";
+    } else {
+        $autoInfo = "\n\n<b>💡 Tip:</b> Use /save to add a card for one-click auto-charge next time.";
     }
 
     tgSend(
@@ -562,36 +662,131 @@ function wpbHandleDepositCommand($cfg, $chatId, $token) {
     tgSend($token, $chatId, "🎮 <b>Please send your WePlay User ID / Username.</b>\n\n<b>Tip: Use /id to link your ID permanently.</b>\n<b>Send /cancel to cancel.</b>");
 }
 
-function wpbHandleAutochargeCommand($cfg, $chatId, $token) {
-    $saved = wpbGetSavedCard($chatId);
-    if (!$saved) {
+/**
+ * Try to tokenise a card via Razorpay Tokens API.
+ * Returns token object or false.
+ */
+function rzpTokeniseCard($cfg, $chatId, array $data) {
+    $keyId     = trim($cfg['razorpay_key_id']    ?? '');
+    $keySecret = trim($cfg['razorpay_key_secret'] ?? '');
+    if (!$keyId || !$keySecret) return false;
+
+    // First ensure customer exists
+    $email   = 'user' . $chatId . '@weplaybot.local';
+    $custRes = rzpRequest('POST', '/customers', [
+        'name'  => 'WePlay User ' . $chatId,
+        'email' => $email,
+        'fail_existing' => '0',
+    ], $keyId, $keySecret);
+    $custId = $custRes['id'] ?? '';
+    if (!$custId) return false;
+
+    $tokRes = rzpRequest('POST', '/customers/' . $custId . '/tokens', [
+        'max_payment_attempts' => 10,
+        'card' => [
+            'number'           => $data['card_number'] ?? '',
+            'cvv'              => $data['cvv'] ?? '',
+            'expiry_month'     => (int)($data['expiry_month'] ?? 0),
+            'expiry_year'      => (int)($data['expiry_year'] ?? 0),
+            'name'             => $data['holder_name'] ?? '',
+        ],
+        'recurring'       => 1,
+        'auth_type'       => 'card',
+    ], $keyId, $keySecret);
+
+    if (!empty($tokRes['id'])) {
+        $tokRes['customer_id'] = $custId;
+        return $tokRes;
+    }
+    return false;
+}
+
+function wpbHandleSaveCardStart($cfg, $chatId, $token) {
+    wpbSetState($chatId, 'save_card_number', []);
+    tgSend($token, $chatId,
+        "💳 <b>Save a Card for Auto-Charge</b>\n\n"
+        . "🔐 <b>Your card details are used only for tokenisation and are never stored permanently.</b>\n\n"
+        . "<b>Step 1/4 — Enter your card number</b> (digits only):\n<b>Example:</b> <code>4111111111111111</code>\n\n"
+        . "<b>Send /cancel to cancel at any time.</b>"
+    );
+}
+
+function wpbHandleMyCards($cfg, $chatId, $token) {
+    $u     = wpbGetUserCards($chatId);
+    $cards = $u['cards'] ?? [];
+    if (empty($cards)) {
         tgSend($token, $chatId,
-            "⚡ <b>Auto-Charge</b>\n\n"
-            . "<b>You have no saved card.</b>\n\n"
-            . "<b>Complete a card deposit via /Deposit — after payment, your card details will be saved for one-click auto-charge.</b>"
+            "💳 <b>My Saved Cards</b>\n\n"
+            . "<b>You have no saved cards.</b>\n\n"
+            . "<b>Use /save to add a card.</b>"
         );
         return;
     }
-    $net  = $saved['network'] ? ' (' . htmlspecialchars($saved['network'], ENT_NOQUOTES, 'UTF-8') . ')' : '';
-    $l4   = $saved['last4']   ? ' •••• ' . htmlspecialchars($saved['last4'], ENT_NOQUOTES, 'UTF-8')  : '';
-    $on   = !empty($saved['autocharge']);
-    $status = $on ? '✅ <b>Enabled</b>' : '❌ <b>Disabled</b>';
-    $keyboard = ['inline_keyboard' => [
+    $defIdx = (int)($u['default_idx'] ?? 0);
+    $lines  = "💳 <b>My Saved Cards</b>\n\n";
+    $keyboard = [];
+    foreach ($cards as $i => $c) {
+        $def   = ($i === $defIdx) ? ' ⭐ (default)' : '';
+        $ac    = !empty($c['autocharge']) ? '⚡' : '⏸';
+        $label = wpbCardLabel($c, $i);
+        $lines .= "<b>" . ($i + 1) . ".</b> {$label}{$def} {$ac}\n";
+        $row = [];
+        if ($i !== $defIdx) {
+            $row[] = ['text' => '⭐ Set Default #' . ($i + 1), 'callback_data' => 'card_default:' . $i];
+        }
+        $row[] = ['text' => '🗑 Remove #' . ($i + 1), 'callback_data' => 'card_remove:' . $i];
+        $keyboard[] = $row;
+    }
+    $lines .= "\n<b>⭐ = default card used for auto-charge</b>\n<b>⚡ = auto-charge ON | ⏸ = OFF</b>\n\n"
+            . "<b>Use /save to add another card.</b>";
+    tgSend($token, $chatId, $lines, $keyboard ? ['inline_keyboard' => $keyboard] : null);
+}
+
+function wpbHandleAutochargeCommand($cfg, $chatId, $token) {
+    $u     = wpbGetUserCards($chatId);
+    $cards = $u['cards'] ?? [];
+    if (empty($cards)) {
+        tgSend($token, $chatId,
+            "⚡ <b>Auto-Charge</b>\n\n"
+            . "<b>You have no saved cards.</b>\n\n"
+            . "<b>Use /save to add a card for one-click auto-charge.</b>"
+        );
+        return;
+    }
+    $defIdx  = (int)($u['default_idx'] ?? 0);
+    $default = $cards[$defIdx] ?? $cards[0];
+    $on      = !empty($default['autocharge']);
+    $net     = $default['network'] ? ' (' . htmlspecialchars($default['network'], ENT_NOQUOTES, 'UTF-8') . ')' : '';
+    $l4      = $default['last4']   ? ' •••• ' . htmlspecialchars($default['last4'], ENT_NOQUOTES, 'UTF-8')  : '';
+    $status  = $on ? '✅ <b>Enabled</b>' : '❌ <b>Disabled</b>';
+    $total   = count($cards);
+
+    $keyboard = [
         [[
             'text'          => $on ? '🔴 Disable Auto-Charge' : '🟢 Enable Auto-Charge',
             'callback_data' => $on ? 'ac_off' : 'ac_on',
         ]],
         [[
-            'text'          => '🗑️ Remove Saved Card',
+            'text'          => '💳 Manage All Cards (' . $total . ')',
+            'callback_data' => 'ac_mycards',
+        ]],
+        [[
+            'text'          => '➕ Add New Card',
+            'callback_data' => 'ac_addcard',
+        ]],
+        [[
+            'text'          => '🗑️ Remove Default Card',
             'callback_data' => 'ac_remove',
         ]],
-    ]];
+    ];
     tgSend($token, $chatId,
         "⚡ <b>Auto-Charge Settings</b>\n\n"
-        . "<b>Saved Card:</b> Card{$l4}{$net}\n"
-        . "<b>Status:</b> {$status}\n\n"
-        . "<b>When enabled, future deposits will automatically charge your saved card without requiring you to open a payment page.</b>",
-        $keyboard
+        . "<b>Default Card:</b> Card{$l4}{$net}\n"
+        . "<b>Total Saved Cards:</b> {$total}\n"
+        . "<b>Auto-Charge:</b> {$status}\n\n"
+        . "<b>When enabled, future deposits will automatically charge your default card.</b>\n"
+        . "<b>Use /mycards to view and manage all saved cards.</b>",
+        ['inline_keyboard' => $keyboard]
     );
 }
 
@@ -607,7 +802,19 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
     if (strcasecmp($text, '/help') === 0) {
-        tgSend($token, $chatId, "❓ <b>Help</b>\n\n<b>/id - Link your WePlay ID and open the payment section</b>\n<b>/pay - Open the secure WePlay payment page</b>\n<b>/Deposit - Create a deposit request</b>\n<b>/Withdrawal - Create a withdrawal request</b>\n<b>/Balance - Check your local balance</b>\n<b>/cancel - Cancel the current process</b>\n\n<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+        tgSend($token, $chatId,
+            "❓ <b>Help</b>\n\n"
+            . "<b>/id — Link your WePlay ID and open the payment section</b>\n"
+            . "<b>/pay — Open the secure WePlay payment page</b>\n"
+            . "<b>/Deposit — Create a deposit request</b>\n"
+            . "<b>/Withdrawal — Create a withdrawal request</b>\n"
+            . "<b>/Balance — Check your local balance</b>\n"
+            . "<b>/save — Add a card for one-click auto-charge</b>\n"
+            . "<b>/mycards — View and manage all your saved cards</b>\n"
+            . "<b>/autocharge — Enable/disable auto-charge on default card</b>\n"
+            . "<b>/cancel — Cancel the current process</b>\n\n"
+            . "<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8')
+        );
         return;
     }
     if (strcasecmp($text, '/cancel') === 0) {
@@ -656,9 +863,17 @@ function wpbHandleText($cfg, $msg) {
         wpbHandleAutochargeCommand($cfg, $chatId, $token);
         return;
     }
+    if (strcasecmp($text, '/save') === 0) {
+        wpbHandleSaveCardStart($cfg, $chatId, $token);
+        return;
+    }
+    if (strcasecmp($text, '/mycards') === 0) {
+        wpbHandleMyCards($cfg, $chatId, $token);
+        return;
+    }
 
     if (!$state) {
-        tgSend($token, $chatId, "❓ <b>Command not recognized. Please use /Deposit, /Withdrawal, /Balance, /id, /pay, or /Help.</b>");
+        tgSend($token, $chatId, "❓ <b>Command not recognized. Please use /Deposit, /Withdrawal, /Balance, /id, /pay, /save, /autocharge, or /Help.</b>");
         return;
     }
 
@@ -706,7 +921,7 @@ function wpbHandleText($cfg, $msg) {
         ];
 
         // ── Auto-charge via saved card token ────────────────────────────────
-        $saved = wpbGetSavedCard($chatId);
+        $saved = wpbGetDefaultCard($chatId);
         if ($saved && !empty($saved['autocharge']) && !empty($cfg['razorpay_key_id'])) {
             wpbClearState($chatId);
             wpbDepositCompleted($chatId);
@@ -831,6 +1046,117 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
 
+    // ── /save multi-step card entry states ────────────────────────────────────
+    if ($s === 'save_card_number') {
+        $raw = preg_replace('/\D/', '', $text);
+        if (strlen($raw) < 13 || strlen($raw) > 19) {
+            tgSend($token, $chatId, "❌ <b>Invalid card number.</b> Please enter a valid 13–19 digit card number.\n<b>Send /cancel to cancel.</b>");
+            return;
+        }
+        $last4 = substr($raw, -4);
+        $data['card_number'] = $raw;
+        $data['last4']       = $last4;
+        wpbSetState($chatId, 'save_card_expiry', $data);
+        tgSend($token, $chatId,
+            "✅ Card ending in <b>{$last4}</b> noted.\n\n"
+            . "📅 <b>Enter expiry date</b> (MM/YY or MM/YYYY):\n<b>Example:</b> <code>08/27</code>\n<b>Send /cancel to cancel.</b>"
+        );
+        return;
+    }
+
+    if ($s === 'save_card_expiry') {
+        if (!preg_match('/^(0[1-9]|1[0-2])\/?(\d{2}|\d{4})$/', trim($text), $em)) {
+            tgSend($token, $chatId, "❌ <b>Invalid expiry.</b> Format: MM/YY — e.g. <code>08/27</code>\n<b>Send /cancel to cancel.</b>");
+            return;
+        }
+        $month = $em[1];
+        $year  = strlen($em[2]) === 2 ? '20' . $em[2] : $em[2];
+        $data['expiry_month'] = $month;
+        $data['expiry_year']  = $year;
+        wpbSetState($chatId, 'save_card_cvv', $data);
+        tgSend($token, $chatId,
+            "✅ Expiry noted.\n\n"
+            . "🔒 <b>Enter CVV</b> (3 or 4 digits):\n\n"
+            . "⚠️ <b>Note:</b> CVV is used only for tokenisation and is NOT stored permanently.\n<b>Send /cancel to cancel.</b>"
+        );
+        return;
+    }
+
+    if ($s === 'save_card_cvv') {
+        $cvv = trim($text);
+        if (!preg_match('/^\d{3,4}$/', $cvv)) {
+            tgSend($token, $chatId, "❌ <b>Invalid CVV.</b> Enter 3 or 4 digits.\n<b>Send /cancel to cancel.</b>");
+            return;
+        }
+        $data['cvv'] = $cvv;
+        wpbSetState($chatId, 'save_card_name', $data);
+        tgSend($token, $chatId,
+            "✅ CVV noted.\n\n"
+            . "👤 <b>Enter cardholder name</b> (as printed on card):\n<b>Example:</b> <code>RAHUL SHARMA</code>\n<b>Send /cancel to cancel.</b>"
+        );
+        return;
+    }
+
+    if ($s === 'save_card_name') {
+        $name = trim($text);
+        if (mb_strlen($name) < 2) {
+            tgSend($token, $chatId, "❌ <b>Please enter a valid name.</b>");
+            return;
+        }
+        $data['holder_name'] = strtoupper($name);
+        wpbClearState($chatId);
+
+        // Detect card network from first digit
+        $num = $data['card_number'] ?? '';
+        if (str_starts_with($num, '4'))       $network = 'Visa';
+        elseif (preg_match('/^5[1-5]/', $num)) $network = 'Mastercard';
+        elseif (preg_match('/^3[47]/', $num))  $network = 'Amex';
+        elseif (preg_match('/^6/', $num))      $network = 'RuPay/Discover';
+        else                                   $network = 'Card';
+
+        // Try Razorpay tokenisation if credentials present
+        $tokenised = false;
+        $custId = '';
+        $tokId  = '';
+        if (!empty($cfg['razorpay_key_id']) && !empty($cfg['razorpay_key_secret'])) {
+            $rzpTok = rzpTokeniseCard($cfg, $chatId, $data);
+            if ($rzpTok && !empty($rzpTok['id'])) {
+                $custId    = $rzpTok['customer_id'] ?? '';
+                $tokId     = $rzpTok['id'];
+                $network   = $rzpTok['card']['network'] ?? $network;
+                $last4     = $rzpTok['card']['last4']   ?? $data['last4'];
+                $tokenised = true;
+            }
+        }
+
+        $cardEntry = [
+            'type'          => $tokenised ? 'razorpay_token' : 'manual',
+            'customer_id'   => $custId,
+            'token_id'      => $tokId,
+            'last4'         => $data['last4'] ?? '',
+            'network'       => $network,
+            'holder_name'   => $data['holder_name'],
+            'expiry_month'  => $data['expiry_month'] ?? '',
+            'expiry_year'   => $data['expiry_year'] ?? '',
+            'autocharge'    => true,
+        ];
+        // Never store raw card number or CVV persistently
+        $idx = wpbAddCard($chatId, $cardEntry);
+        $label = wpbCardLabel($cardEntry, $idx);
+
+        wpbLog("Card saved chat={$chatId} last4={$cardEntry['last4']} type={$cardEntry['type']}", 'success');
+
+        tgSend($token, $chatId,
+            "✅ <b>Card Saved!</b>\n\n"
+            . "<b>{$label}</b>\n"
+            . "<b>Expiry:</b> {$cardEntry['expiry_month']}/{$cardEntry['expiry_year']}\n"
+            . ($tokenised ? "⚡ <b>Razorpay tokenised — auto-charge ready!</b>" : "💾 <b>Saved locally. Auto-charge will use Razorpay when configured.</b>") . "\n\n"
+            . "<b>Use /mycards to view all saved cards.</b>\n"
+            . "<b>Use /autocharge to manage auto-charge.</b>"
+        );
+        return;
+    }
+
     if ($s === 'withdraw_weplay_id') {
         $data['weplay_id'] = $text;
         wpbSetState($chatId, 'withdraw_amount', $data);
@@ -879,22 +1205,55 @@ function wpbHandleCallback($cfg, $cb) {
     $cbId = $cb['id'] ?? '';
     $chatId = $cb['message']['chat']['id'] ?? ($cb['from']['id'] ?? '');
 
-    // ── Auto-charge toggle / remove ──────────────────────────────────────────
-    if ($data === 'ac_on' || $data === 'ac_off' || $data === 'ac_remove') {
+    // ── Auto-charge toggle / remove / manage ────────────────────────────────
+    if (in_array($data, ['ac_on','ac_off','ac_remove','ac_mycards','ac_addcard'], true)
+        || preg_match('/^card_(remove|default):(\d+)$/', $data, $cardM)) {
+
+        // card_remove:N or card_default:N
+        if (!empty($cardM)) {
+            $cardAction = $cardM[1];
+            $cardIdx    = (int)$cardM[2];
+            if ($cardAction === 'remove') {
+                wpbDeleteCardByIndex($chatId, $cardIdx);
+                tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Card removed'], $token);
+                tgSend($token, $chatId, "🗑️ <b>Card #" . ($cardIdx + 1) . " removed.</b>");
+                wpbHandleMyCards($cfg, $chatId, $token);
+            } else {
+                wpbSetDefaultCard($chatId, $cardIdx);
+                tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Default card set'], $token);
+                tgSend($token, $chatId, "⭐ <b>Card #" . ($cardIdx + 1) . " set as default.</b>");
+                wpbHandleMyCards($cfg, $chatId, $token);
+            }
+            return;
+        }
+
+        if ($data === 'ac_mycards') {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => ''], $token);
+            wpbHandleMyCards($cfg, $chatId, $token);
+            return;
+        }
+        if ($data === 'ac_addcard') {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => ''], $token);
+            wpbHandleSaveCardStart($cfg, $chatId, $token);
+            return;
+        }
         if ($data === 'ac_remove') {
-            wpbDeleteSavedCard($chatId);
-            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Saved card removed', 'show_alert' => true], $token);
-            tgSend($token, $chatId, "🗑️ <b>Your saved card has been removed.</b>");
+            // Remove default card
+            $u   = wpbGetUserCards($chatId);
+            $idx = (int)($u['default_idx'] ?? 0);
+            wpbDeleteCardByIndex($chatId, $idx);
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Default card removed', 'show_alert' => true], $token);
+            tgSend($token, $chatId, "🗑️ <b>Default card removed.</b>\n\n<b>Use /mycards to manage remaining cards or /save to add a new one.</b>");
             return;
         }
         $enable = ($data === 'ac_on');
-        $ok = wpbToggleAutoCharge($chatId, $enable);
-        $msg = $enable ? '✅ Auto-charge enabled' : '❌ Auto-charge disabled';
+        $ok     = wpbToggleAutoCharge($chatId, $enable);
+        $msg    = $enable ? '✅ Auto-charge enabled' : '❌ Auto-charge disabled';
         tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => $msg, 'show_alert' => false], $token);
         if ($ok) {
-            tgSend($token, $chatId, "⚡ <b>" . ($enable ? "Auto-charge enabled." : "Auto-charge disabled.") . "</b>\n\n<b>Use /autocharge to manage your saved card.</b>");
+            tgSend($token, $chatId, "⚡ <b>" . ($enable ? "Auto-charge enabled." : "Auto-charge disabled.") . "</b>\n\n<b>Use /autocharge to manage your saved cards.</b>");
         } else {
-            tgSend($token, $chatId, "⚠️ <b>No saved card found. Use /Deposit first.</b>");
+            tgSend($token, $chatId, "⚠️ <b>No saved card found. Use /save to add a card.</b>");
         }
         return;
     }
@@ -947,7 +1306,7 @@ function wpbHandleCallback($cfg, $cb) {
 
         // ── Auto-charge: charge saved card directly ──────────────────────────
         if ($methodId === 'autocharge') {
-            $saved = wpbGetSavedCard($chatId);
+            $saved = wpbGetDefaultCard($chatId);
             if (!$saved || empty($cfg['razorpay_key_id'])) {
                 tgSend($token, $chatId,
                     "⚠️ <b>Auto-charge not available.</b>\n\n"
@@ -1273,19 +1632,41 @@ if (isset($_GET['api_action'])) {
             wpbJsonSave(WPB_LOG_FILE, []);
             echo json_encode(['ok' => true]); exit;
         case 'get_saved_cards':
-            echo json_encode(['ok' => true, 'data' => wpbJsonLoad(WPB_CARDS_FILE)]); exit;
+            // Flatten to a list for easier rendering: [{chat_id, card_idx, ...card_fields}]
+            $rawStore = wpbJsonLoad(WPB_CARDS_FILE);
+            $flatList = [];
+            foreach ($rawStore as $cid => $udata) {
+                $defIdx = (int)($udata['default_idx'] ?? 0);
+                foreach (($udata['cards'] ?? []) as $ci => $card) {
+                    $flatList[] = array_merge($card, [
+                        'chat_id'    => $cid,
+                        'card_idx'   => $ci,
+                        'is_default' => ($ci === $defIdx),
+                    ]);
+                }
+            }
+            echo json_encode(['ok' => true, 'data' => $flatList]); exit;
         case 'delete_saved_card':
             $chatIdToRemove = (string)($body['chat_id'] ?? '');
+            $cardIdxToRemove = isset($body['card_idx']) ? (int)$body['card_idx'] : null;
             if (!$chatIdToRemove) { echo json_encode(['ok' => false, 'error' => 'chat_id required']); exit; }
-            wpbDeleteSavedCard($chatIdToRemove);
-            wpbLog("Admin removed saved card for chat={$chatIdToRemove}", 'info');
+            if ($cardIdxToRemove !== null) {
+                wpbDeleteCardByIndex($chatIdToRemove, $cardIdxToRemove);
+                wpbLog("Admin removed card idx={$cardIdxToRemove} for chat={$chatIdToRemove}", 'info');
+            } else {
+                wpbDeleteSavedCard($chatIdToRemove);
+                wpbLog("Admin removed all cards for chat={$chatIdToRemove}", 'info');
+            }
             echo json_encode(['ok' => true]); exit;
         case 'toggle_autocharge':
             $chatIdToToggle = (string)($body['chat_id'] ?? '');
             $enableAC       = (bool)($body['enabled'] ?? false);
+            $cardIdxToggle  = isset($body['card_idx']) ? (int)$body['card_idx'] : null;
             if (!$chatIdToToggle) { echo json_encode(['ok' => false, 'error' => 'chat_id required']); exit; }
-            $ok = wpbToggleAutoCharge($chatIdToToggle, $enableAC);
-            wpbLog("Admin toggled autocharge chat={$chatIdToToggle} enabled=" . ($enableAC ? '1' : '0'), 'info');
+            $ok = $cardIdxToggle !== null
+                ? wpbToggleAutoChargeByIdx($chatIdToToggle, $cardIdxToggle, $enableAC)
+                : wpbToggleAutoCharge($chatIdToToggle, $enableAC);
+            wpbLog("Admin toggled autocharge chat={$chatIdToToggle} card_idx={$cardIdxToggle} enabled=" . ($enableAC ? '1' : '0'), 'info');
             echo json_encode(['ok' => $ok]); exit;
         case 'set_rzp_webhook':
             if (empty($cfg['bot_token'])) { echo json_encode(['ok' => false, 'error' => 'Bot token missing']); exit; }
@@ -1511,27 +1892,30 @@ async function loadPending(){
 async function loadSavedCards(){
   const r=await fetch('?api_action=get_saved_cards').then(x=>x.json());
   const box=g('saved-cards');
-  const rows=Object.values(r.data||{});
+  const rows=(r.data||[]);
   if(!rows.length){box.textContent='No saved cards';return}
-  box.innerHTML=rows.map(c=>`<div style="border-bottom:1px solid var(--b);padding:7px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+  box.innerHTML=rows.map((c,i)=>`<div style="border-bottom:1px solid var(--b);padding:8px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span><b>Chat:</b> ${esc(c.chat_id)}</span>
-    <span><b>Card:</b> ${c.last4?'•••• '+esc(c.last4)+' ('+esc(c.network)+')':'–'}</span>
-    <span><b>Status:</b> <span class="${c.autocharge?'ok':'err'}">${c.autocharge?'⚡ Auto-ON':'⏸ Auto-OFF'}</span></span>
-    <span style="color:var(--td);font-size:11px">${new Date(c.saved_at).toLocaleString()}</span>
-    <button class="btn bgr" style="padding:4px 10px;font-size:11px" onclick="toggleAC('${esc(c.chat_id)}',${c.autocharge?'false':'true'})">${c.autocharge?'Disable':'Enable'}</button>
-    <button class="btn br" style="padding:4px 10px;font-size:11px" onclick="removeCard('${esc(c.chat_id)}')">Remove</button>
+    <span><b>Card ${Number(c.card_idx)+1}${c.is_default?' ⭐':''}:</b> ${c.last4?'•••• '+esc(c.last4)+' '+esc(c.network||''):'–'}</span>
+    ${c.holder_name?`<span><b>Name:</b> ${esc(c.holder_name)}</span>`:''}
+    ${c.expiry_month?`<span><b>Exp:</b> ${esc(c.expiry_month)}/${esc(c.expiry_year||'')}</span>`:''}
+    <span><b>Type:</b> ${esc(c.type||'manual')}</span>
+    <span><b>AC:</b> <span class="${c.autocharge?'ok':'err'}">${c.autocharge?'⚡ ON':'⏸ OFF'}</span></span>
+    <span style="color:var(--td);font-size:11px">${new Date(c.saved_at||0).toLocaleString()}</span>
+    <button class="btn bgr" style="padding:4px 8px;font-size:11px" onclick="toggleAC('${esc(c.chat_id)}',${c.card_idx},${c.autocharge?'false':'true'})">${c.autocharge?'Disable AC':'Enable AC'}</button>
+    <button class="btn br" style="padding:4px 8px;font-size:11px" onclick="removeCard('${esc(c.chat_id)}',${c.card_idx})">Remove</button>
   </div>`).join('')
 }
 
-async function toggleAC(chatId,enable){
-  const r=await api('toggle_autocharge',{chat_id:chatId,enabled:enable==='true'||enable===true});
+async function toggleAC(chatId,cardIdx,enable){
+  const r=await api('toggle_autocharge',{chat_id:chatId,card_idx:Number(cardIdx),enabled:enable==='true'||enable===true});
   toast(r.ok?'Updated':'Error');
   loadSavedCards();
 }
 
-async function removeCard(chatId){
-  if(!confirm('Remove saved card for chat '+chatId+'?'))return;
-  const r=await api('delete_saved_card',{chat_id:chatId});
+async function removeCard(chatId,cardIdx){
+  if(!confirm('Remove card #'+(Number(cardIdx)+1)+' for chat '+chatId+'?'))return;
+  const r=await api('delete_saved_card',{chat_id:chatId,card_idx:Number(cardIdx)});
   toast(r.ok?'Removed':'Error');
   loadSavedCards();
 }
