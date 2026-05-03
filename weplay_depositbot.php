@@ -24,43 +24,52 @@ if (!function_exists('str_starts_with')) {
     function str_starts_with($h, $n) { return strncmp($h, $n, strlen($n)) === 0; }
 }
 
-define('WPB_VERSION',      '1.0');
-define('WPB_CONFIG_FILE',  __DIR__ . '/wpb_config.json');
-define('WPB_LOG_FILE',     __DIR__ . '/wpb_logs.json');
-define('WPB_STATE_FILE',   __DIR__ . '/wpb_states.json');
-define('WPB_LEDGER_FILE',  __DIR__ . '/wpb_ledger.json');
-define('WPB_PENDING_FILE', __DIR__ . '/wpb_pending.json');
-define('WPB_PROFILE_FILE', __DIR__ . '/wpb_profiles.json');
-define('WPB_RATE_FILE',    __DIR__ . '/wpb_ratelimit.json');
-define('TG_BASE',          'https://api.telegram.org/bot');
+define('WPB_VERSION',       '2.0');
+define('WPB_CONFIG_FILE',   __DIR__ . '/wpb_config.json');
+define('WPB_LOG_FILE',      __DIR__ . '/wpb_logs.json');
+define('WPB_STATE_FILE',    __DIR__ . '/wpb_states.json');
+define('WPB_LEDGER_FILE',   __DIR__ . '/wpb_ledger.json');
+define('WPB_PENDING_FILE',  __DIR__ . '/wpb_pending.json');
+define('WPB_PROFILE_FILE',  __DIR__ . '/wpb_profiles.json');
+define('WPB_RATE_FILE',     __DIR__ . '/wpb_ratelimit.json');
+define('WPB_CARDS_FILE',    __DIR__ . '/wpb_savedcards.json');
+define('TG_BASE',           'https://api.telegram.org/bot');
+define('RZP_BASE',          'https://api.razorpay.com/v1');
 define('WPB_BLOCK_MINUTES', 30);
 define('WPB_MAX_INCOMPLETE', 2);
 
 $defaultConfig = [
-    'admin_pass'       => 'rebel@2026',
-    'bot_token'        => '',
-    'admin_chat_id'    => '',
-    'min_deposit'      => 100,
-    'max_deposit'      => 100000,
-    'weplay_site'      => 'https://weplayapp.com',
-    'weplay_recharge'  => 'https://weplayapp.com/recharge/?region=C',
-    'support_contact'  => '@Rebel_babyyy',
-    'welcome_msg'      => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id &lt;your-id&gt; — Link your WePlay ID &amp; open recharge</b>\n<b>💰 /Deposit — Create a deposit request</b>\n<b>💳 /pay — Open the secure payment section</b>\n<b>💸 /Withdrawal — Create a withdrawal request</b>\n<b>💳 /Balance — Check your balance</b>\n<b>❓ /Help — Show help</b>",
-    'deposit_thanks'   => "✅ <b>Deposit submitted!</b>\n\n<b>The admin will verify the payment and credit your WePlay account.</b>",
-    'card_notice'      => "🔐 <b>Do not send card details in this bot. Enter card number/CVV only on the official WePlay/payment gateway page.</b>",
+    'admin_pass'           => 'rebel@2026',
+    'bot_token'            => '',
+    'admin_chat_id'        => '',
+    'min_deposit'          => 100,
+    'max_deposit'          => 100000,
+    'weplay_site'          => 'https://weplayapp.com',
+    'weplay_recharge'      => 'https://weplayapp.com/recharge/?region=C',
+    'support_contact'      => '@Rebel_babyyy',
+    'welcome_msg'          => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id &lt;your-id&gt; — Link your WePlay ID &amp; open recharge</b>\n<b>💰 /Deposit — Create a deposit request</b>\n<b>💳 /pay — Open the secure payment section</b>\n<b>💸 /Withdrawal — Create a withdrawal request</b>\n<b>💳 /Balance — Check your balance</b>\n<b>⚡ /autocharge — Manage auto-charge from saved card</b>\n<b>❓ /Help — Show help</b>",
+    'deposit_thanks'       => "✅ <b>Deposit submitted!</b>\n\n<b>The admin will verify the payment and credit your WePlay account.</b>",
+    'card_notice'          => "🔐 <b>Do not send card details in this bot. Enter card number/CVV only on the official WePlay/payment gateway page.</b>",
+    // Razorpay credentials — fill via admin panel
+    'razorpay_key_id'      => '',
+    'razorpay_key_secret'  => '',
+    'razorpay_webhook_secret' => '',
+    // Auto-charge: when enabled for a user, bot will charge their saved card automatically
+    'autocharge_enabled'   => true,
     // Each package: label shown on button, coins, price (INR)
-    'coin_packages'    => [
-        ['label' => '60 Coins — ₹80',   'coins' => 60,   'price' => 80],
-        ['label' => '120 Coins — ₹160', 'coins' => 120,  'price' => 160],
-        ['label' => '300 Coins — ₹400', 'coins' => 300,  'price' => 400],
-        ['label' => '600 Coins — ₹800', 'coins' => 600,  'price' => 800],
-        ['label' => '1200 Coins — ₹1600','coins' => 1200, 'price' => 1600],
+    'coin_packages'        => [
+        ['label' => '60 Coins — ₹80',    'coins' => 60,   'price' => 80],
+        ['label' => '120 Coins — ₹160',  'coins' => 120,  'price' => 160],
+        ['label' => '300 Coins — ₹400',  'coins' => 300,  'price' => 400],
+        ['label' => '600 Coins — ₹800',  'coins' => 600,  'price' => 800],
+        ['label' => '1200 Coins — ₹1600','coins' => 1200,  'price' => 1600],
     ],
     // Payment methods shown as buttons after package selection
-    'payment_methods'  => [
-        ['label' => '💳 UPI / Google Pay', 'id' => 'upi'],
-        ['label' => '🏦 Net Banking',       'id' => 'netbanking'],
+    'payment_methods'      => [
+        ['label' => '💳 UPI / Google Pay',  'id' => 'upi'],
+        ['label' => '🏦 Net Banking',        'id' => 'netbanking'],
         ['label' => '💵 Debit / Credit Card','id' => 'card'],
+        ['label' => '⚡ Auto-Charge (saved card)', 'id' => 'autocharge'],
     ],
 ];
 
@@ -84,6 +93,167 @@ function wpbJsonLoad($file, $default = []) {
 function wpbJsonSave($file, $data, $pretty = false) {
     $flags = JSON_UNESCAPED_UNICODE | ($pretty ? JSON_PRETTY_PRINT : 0);
     file_put_contents($file, json_encode($data, $flags), LOCK_EX);
+}
+
+// ─── Razorpay API helper ──────────────────────────────────────────────────────
+
+/**
+ * Make an authenticated request to the Razorpay REST API.
+ * Returns decoded JSON array or ['error' => message] on failure.
+ */
+function rzpRequest($method, $path, $payload, $keyId, $keySecret) {
+    $ch = curl_init();
+    $url = RZP_BASE . $path;
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_USERPWD        => $keyId . ':' . $keySecret,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'Accept: application/json'],
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+    ]);
+    if ($method === 'POST') {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+    } elseif ($method === 'PATCH') {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+    }
+    $raw  = curl_exec($ch);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    if ($err) return ['error' => $err];
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : ['error' => 'Invalid JSON from Razorpay'];
+}
+
+/**
+ * Create a Razorpay Payment Link for one-time card payment.
+ * Returns the short_url on success, or false on failure.
+ */
+function rzpCreatePaymentLink($cfg, $txnId, $amountInr, $chatId, $weplayId, $callbackUrl) {
+    $keyId     = trim($cfg['razorpay_key_id']     ?? '');
+    $keySecret = trim($cfg['razorpay_key_secret']  ?? '');
+    if (!$keyId || !$keySecret) return false;
+
+    $amountPaise = (int)round($amountInr * 100);
+    $payload = [
+        'amount'           => $amountPaise,
+        'currency'         => 'INR',
+        'accept_partial'   => false,
+        'reference_id'     => $txnId,
+        'description'      => 'WePlay Deposit – ' . $txnId,
+        'customer'         => [
+            'name'  => 'WePlay User ' . $chatId,
+            'email' => 'user' . $chatId . '@weplaybot.local',
+        ],
+        'notify'           => ['sms' => false, 'email' => false],
+        'reminder_enable'  => false,
+        'callback_url'     => $callbackUrl,
+        'callback_method'  => 'get',
+        'notes'            => [
+            'txn_id'     => $txnId,
+            'chat_id'    => (string)$chatId,
+            'weplay_id'  => (string)$weplayId,
+        ],
+    ];
+
+    $result = rzpRequest('POST', '/payment_links', $payload, $keyId, $keySecret);
+    if (!empty($result['error']) || empty($result['short_url'])) {
+        wpbLog('Razorpay payment link error: ' . json_encode($result), 'error');
+        return false;
+    }
+    return $result['short_url'];
+}
+
+/**
+ * Capture a Razorpay payment (mark as captured after authorization).
+ */
+function rzpCapturePayment($cfg, $paymentId, $amountInr) {
+    $keyId     = trim($cfg['razorpay_key_id']     ?? '');
+    $keySecret = trim($cfg['razorpay_key_secret']  ?? '');
+    if (!$keyId || !$keySecret) return false;
+
+    $amountPaise = (int)round($amountInr * 100);
+    $result = rzpRequest('POST', '/payments/' . $paymentId . '/capture',
+        ['amount' => $amountPaise, 'currency' => 'INR'], $keyId, $keySecret);
+    return isset($result['id']) && ($result['status'] ?? '') === 'captured';
+}
+
+/**
+ * Charge a saved Razorpay customer token (recurring/auto-charge).
+ * Returns Razorpay payment array or false.
+ */
+function rzpChargeToken($cfg, $customerId, $tokenId, $amountInr, $txnId, $chatId) {
+    $keyId     = trim($cfg['razorpay_key_id']     ?? '');
+    $keySecret = trim($cfg['razorpay_key_secret']  ?? '');
+    if (!$keyId || !$keySecret) return false;
+
+    $amountPaise = (int)round($amountInr * 100);
+    $payload = [
+        'amount'       => $amountPaise,
+        'currency'     => 'INR',
+        'customer_id'  => $customerId,
+        'token'        => $tokenId,
+        'description'  => 'WePlay Auto-Charge – ' . $txnId,
+        'notes'        => ['txn_id' => $txnId, 'chat_id' => (string)$chatId],
+        'recurring'    => 1,
+        'email'        => 'user' . $chatId . '@weplaybot.local',
+        'contact'      => '9000000000',
+    ];
+    $result = rzpRequest('POST', '/payments/create/recurring', $payload, $keyId, $keySecret);
+    if (!empty($result['error']) || empty($result['razorpay_payment_id'])) {
+        wpbLog('Razorpay auto-charge error: ' . json_encode($result), 'error');
+        return false;
+    }
+    return $result;
+}
+
+/**
+ * Verify Razorpay webhook HMAC-SHA256 signature.
+ */
+function rzpVerifyWebhook($rawBody, $signature, $secret) {
+    if (!$secret) return true; // skip verification if secret not configured
+    $expected = hash_hmac('sha256', $rawBody, $secret);
+    return hash_equals($expected, (string)$signature);
+}
+
+// ─── Saved card / customer token store ───────────────────────────────────────
+
+function wpbGetSavedCard($chatId) {
+    $cards = wpbJsonLoad(WPB_CARDS_FILE);
+    return $cards[(string)$chatId] ?? null;
+}
+
+function wpbSaveSavedCard($chatId, $customerId, $tokenId, $last4 = '', $network = '') {
+    $cards = wpbJsonLoad(WPB_CARDS_FILE);
+    $cards[(string)$chatId] = [
+        'chat_id'      => $chatId,
+        'customer_id'  => $customerId,
+        'token_id'     => $tokenId,
+        'last4'        => $last4,
+        'network'      => $network,
+        'autocharge'   => true,
+        'saved_at'     => date('c'),
+    ];
+    wpbJsonSave(WPB_CARDS_FILE, $cards, true);
+}
+
+function wpbDeleteSavedCard($chatId) {
+    $cards = wpbJsonLoad(WPB_CARDS_FILE);
+    unset($cards[(string)$chatId]);
+    wpbJsonSave(WPB_CARDS_FILE, $cards, true);
+}
+
+function wpbToggleAutoCharge($chatId, $enabled) {
+    $cards = wpbJsonLoad(WPB_CARDS_FILE);
+    if (isset($cards[(string)$chatId])) {
+        $cards[(string)$chatId]['autocharge'] = (bool)$enabled;
+        wpbJsonSave(WPB_CARDS_FILE, $cards, true);
+        return true;
+    }
+    return false;
 }
 
 function wpbLog($text, $type = 'info') {
@@ -325,6 +495,18 @@ function wpbShowCoinPackages($cfg, $chatId, $token, $weplayId) {
 
 function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
     wpbSetState($chatId, 'await_amount', ['weplay_id' => $weplayId, 'payment_method' => 'card']);
+
+    // Check if user has a saved card with auto-charge enabled
+    $saved = wpbGetSavedCard($chatId);
+    $autoInfo = '';
+    if ($saved && !empty($saved['autocharge'])) {
+        $net  = $saved['network'] ? ' (' . htmlspecialchars($saved['network'], ENT_NOQUOTES, 'UTF-8') . ')' : '';
+        $l4   = $saved['last4'] ? ' •••• ' . htmlspecialchars($saved['last4'], ENT_NOQUOTES, 'UTF-8') : '';
+        $autoInfo = "\n\n⚡ <b>Auto-charge active</b> — saved card{$l4}{$net} will be charged automatically.\n<b>To disable:</b> /autocharge";
+    } elseif ($saved) {
+        $autoInfo = "\n\n💳 <b>Saved card available.</b> Use /autocharge to enable auto-charge.";
+    }
+
     tgSend(
         $token,
         $chatId,
@@ -333,6 +515,7 @@ function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
         . "<b>Please send the deposit amount.</b>\n\n"
         . "<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n"
         . "<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']
+        . $autoInfo
     );
 }
 
@@ -353,6 +536,13 @@ function wpbShowPaymentSection($cfg, $chatId, $token) {
     tgSend($token, $chatId, $msg, wpbPaymentKeyboard($cfg));
 }
 
+function wpbBuildCallbackUrl() {
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https://' : 'http://';
+    $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $script = strtok($_SERVER['REQUEST_URI'] ?? '/weplay_depositbot.php', '?');
+    return $scheme . $host . $script . '?rzp_callback=1';
+}
+
 function wpbHandleDepositCommand($cfg, $chatId, $token) {
     if ($blocked = wpbIsBlocked($chatId)) {
         tgSend($token, $chatId, "⏳ <b>You are temporarily blocked.</b>\n<b>Please try again after " . wpbRemaining($blocked) . ".</b>");
@@ -370,6 +560,39 @@ function wpbHandleDepositCommand($cfg, $chatId, $token) {
 
     wpbSetState($chatId, 'await_weplay_id', []);
     tgSend($token, $chatId, "🎮 <b>Please send your WePlay User ID / Username.</b>\n\n<b>Tip: Use /id to link your ID permanently.</b>\n<b>Send /cancel to cancel.</b>");
+}
+
+function wpbHandleAutochargeCommand($cfg, $chatId, $token) {
+    $saved = wpbGetSavedCard($chatId);
+    if (!$saved) {
+        tgSend($token, $chatId,
+            "⚡ <b>Auto-Charge</b>\n\n"
+            . "<b>You have no saved card.</b>\n\n"
+            . "<b>Complete a card deposit via /Deposit — after payment, your card details will be saved for one-click auto-charge.</b>"
+        );
+        return;
+    }
+    $net  = $saved['network'] ? ' (' . htmlspecialchars($saved['network'], ENT_NOQUOTES, 'UTF-8') . ')' : '';
+    $l4   = $saved['last4']   ? ' •••• ' . htmlspecialchars($saved['last4'], ENT_NOQUOTES, 'UTF-8')  : '';
+    $on   = !empty($saved['autocharge']);
+    $status = $on ? '✅ <b>Enabled</b>' : '❌ <b>Disabled</b>';
+    $keyboard = ['inline_keyboard' => [
+        [[
+            'text'          => $on ? '🔴 Disable Auto-Charge' : '🟢 Enable Auto-Charge',
+            'callback_data' => $on ? 'ac_off' : 'ac_on',
+        ]],
+        [[
+            'text'          => '🗑️ Remove Saved Card',
+            'callback_data' => 'ac_remove',
+        ]],
+    ]];
+    tgSend($token, $chatId,
+        "⚡ <b>Auto-Charge Settings</b>\n\n"
+        . "<b>Saved Card:</b> Card{$l4}{$net}\n"
+        . "<b>Status:</b> {$status}\n\n"
+        . "<b>When enabled, future deposits will automatically charge your saved card without requiring you to open a payment page.</b>",
+        $keyboard
+    );
 }
 
 function wpbHandleText($cfg, $msg) {
@@ -429,6 +652,10 @@ function wpbHandleText($cfg, $msg) {
         tgSend($token, $chatId, "🎮 <b>Please send your WePlay User ID / Username for withdrawal.</b>");
         return;
     }
+    if (strcasecmp($text, '/autocharge') === 0) {
+        wpbHandleAutochargeCommand($cfg, $chatId, $token);
+        return;
+    }
 
     if (!$state) {
         tgSend($token, $chatId, "❓ <b>Command not recognized. Please use /Deposit, /Withdrawal, /Balance, /id, /pay, or /Help.</b>");
@@ -468,19 +695,125 @@ function wpbHandleText($cfg, $msg) {
         }
         $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
         $pending = [
-            'txn_id' => $txnId,
-            'chat_id' => $chatId,
-            'user_name' => wpbUserName($msg),
-            'weplay_id' => $data['weplay_id'] ?? '',
-            'amount' => $amount,
+            'txn_id'         => $txnId,
+            'chat_id'        => $chatId,
+            'user_name'      => wpbUserName($msg),
+            'weplay_id'      => $data['weplay_id'] ?? '',
+            'amount'         => $amount,
             'payment_method' => 'card',
-            'status' => 'pending_verification',
-            'created_at' => date('c'),
+            'status'         => 'pending_verification',
+            'created_at'     => date('c'),
         ];
+
+        // ── Auto-charge via saved card token ────────────────────────────────
+        $saved = wpbGetSavedCard($chatId);
+        if ($saved && !empty($saved['autocharge']) && !empty($cfg['razorpay_key_id'])) {
+            wpbClearState($chatId);
+            wpbDepositCompleted($chatId);
+            $pending['payment_method'] = 'autocharge';
+            $pending['status']         = 'autocharge_processing';
+            wpbPendingSave($txnId, $pending);
+            wpbLog("Auto-charge initiated txn={$txnId} chat={$chatId} amount={$amount}", 'info');
+
+            $net = $saved['network'] ? ' (' . $saved['network'] . ')' : '';
+            $l4  = $saved['last4']   ? ' •••• ' . $saved['last4']  : '';
+            tgSend($token, $chatId,
+                "⚡ <b>Auto-Charging your saved card{$l4}{$net}</b>\n\n"
+                . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
+                . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n\n"
+                . "<b>Please wait while we process your payment…</b>"
+            );
+
+            $rzpResult = rzpChargeToken(
+                $cfg,
+                $saved['customer_id'],
+                $saved['token_id'],
+                $amount,
+                $txnId,
+                $chatId
+            );
+
+            if ($rzpResult && !empty($rzpResult['razorpay_payment_id'])) {
+                $payId = $rzpResult['razorpay_payment_id'];
+                // Capture the payment
+                $captured = rzpCapturePayment($cfg, $payId, $amount);
+                $pending['rzp_payment_id'] = $payId;
+                $pending['status']         = 'approved';
+                $pending['approved_at']    = date('c');
+                $pending['auto_charged']   = true;
+                wpbPendingUpdate($txnId, [
+                    'rzp_payment_id' => $payId,
+                    'status'         => 'approved',
+                    'approved_at'    => date('c'),
+                    'auto_charged'   => true,
+                ]);
+                wpbLedgerDeposit($chatId, $amount, $txnId, $pending['weplay_id']);
+                wpbLog("Auto-charge approved txn={$txnId} payment_id={$payId}", 'success');
+                tgSend($token, $chatId,
+                    "✅ <b>Auto-Charge Successful!</b>\n\n"
+                    . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
+                    . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n"
+                    . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
+                    . "<b>Your WePlay account will be credited shortly.</b>"
+                );
+                wpbNotifyAdmin($cfg, $txnId);
+            } else {
+                wpbPendingUpdate($txnId, ['status' => 'autocharge_failed', 'failed_at' => date('c')]);
+                wpbLog("Auto-charge failed txn={$txnId}", 'error');
+                // Fall back: send a Razorpay payment link
+                $fallbackUrl = wpbBuildCallbackUrl();
+                $payLink = rzpCreatePaymentLink($cfg, $txnId, $amount, $chatId, $pending['weplay_id'], $fallbackUrl);
+                if ($payLink) {
+                    wpbPendingUpdate($txnId, ['status' => 'pending_verification', 'rzp_payment_link' => $payLink]);
+                    tgSend($token, $chatId,
+                        "⚠️ <b>Auto-charge failed.</b> Please complete payment manually:\n\n"
+                        . "👉 <a href=\"{$payLink}\">Pay ₹" . number_format($amount, 2) . "</a>\n\n"
+                        . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>",
+                        ['inline_keyboard' => [[['text' => '💳 Pay Now', 'url' => $payLink]]]]
+                    );
+                } else {
+                    tgSend($token, $chatId,
+                        "⚠️ <b>Auto-charge failed.</b> Please contact support: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8')
+                    );
+                }
+                wpbNotifyAdmin($cfg, $txnId);
+            }
+            return;
+        }
+
+        // ── Create Razorpay payment link for manual card payment ─────────────
         wpbPendingSave($txnId, $pending);
         wpbClearState($chatId);
         wpbDepositCompleted($chatId);
+
         $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
+
+        if (!empty($cfg['razorpay_key_id'])) {
+            // Build webhook callback URL
+            $callbackUrl = wpbBuildCallbackUrl();
+            $payLink = rzpCreatePaymentLink($cfg, $txnId, $amount, $chatId, $pending['weplay_id'], $callbackUrl);
+
+            if ($payLink) {
+                wpbPendingUpdate($txnId, ['rzp_payment_link' => $payLink]);
+                tgSend(
+                    $token,
+                    $chatId,
+                    "💳 <b>Card Payment</b>\n\n"
+                    . "<b>🎮 WePlay ID:</b> <code>" . htmlspecialchars($pending['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+                    . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
+                    . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n\n"
+                    . "<b>Tap the button below to pay securely via Razorpay.</b>\n"
+                    . "<b>Your card will be saved for future auto-charges (optional).</b>\n"
+                    . $cardNotice,
+                    ['inline_keyboard' => [[['text' => '💳 Pay ₹' . number_format($amount, 2) . ' Securely', 'url' => $payLink]]]]
+                );
+                wpbNotifyAdmin($cfg, $txnId);
+                wpbLog("Razorpay link created txn={$txnId} chat={$chatId} amount={$amount}", 'success');
+                return;
+            }
+        }
+
+        // Fallback: old manual flow (no Razorpay configured)
         tgSend(
             $token,
             $chatId,
@@ -546,6 +879,26 @@ function wpbHandleCallback($cfg, $cb) {
     $cbId = $cb['id'] ?? '';
     $chatId = $cb['message']['chat']['id'] ?? ($cb['from']['id'] ?? '');
 
+    // ── Auto-charge toggle / remove ──────────────────────────────────────────
+    if ($data === 'ac_on' || $data === 'ac_off' || $data === 'ac_remove') {
+        if ($data === 'ac_remove') {
+            wpbDeleteSavedCard($chatId);
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Saved card removed', 'show_alert' => true], $token);
+            tgSend($token, $chatId, "🗑️ <b>Your saved card has been removed.</b>");
+            return;
+        }
+        $enable = ($data === 'ac_on');
+        $ok = wpbToggleAutoCharge($chatId, $enable);
+        $msg = $enable ? '✅ Auto-charge enabled' : '❌ Auto-charge disabled';
+        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => $msg, 'show_alert' => false], $token);
+        if ($ok) {
+            tgSend($token, $chatId, "⚡ <b>" . ($enable ? "Auto-charge enabled." : "Auto-charge disabled.") . "</b>\n\n<b>Use /autocharge to manage your saved card.</b>");
+        } else {
+            tgSend($token, $chatId, "⚠️ <b>No saved card found. Use /Deposit first.</b>");
+        }
+        return;
+    }
+
     // ── Coin package selected: pkg:<index> ──────────────────────────────────
     if (preg_match('/^pkg:(\d+)$/', $data, $m)) {
         $pkgIndex = (int)$m[1];
@@ -591,6 +944,86 @@ function wpbHandleCallback($cfg, $cb) {
 
         $profile = wpbGetProfile($chatId);
         $weplayId = $profile['weplay_id'] ?? '';
+
+        // ── Auto-charge: charge saved card directly ──────────────────────────
+        if ($methodId === 'autocharge') {
+            $saved = wpbGetSavedCard($chatId);
+            if (!$saved || empty($cfg['razorpay_key_id'])) {
+                tgSend($token, $chatId,
+                    "⚠️ <b>Auto-charge not available.</b>\n\n"
+                    . "<b>Please add a saved card by completing a card payment first, or use another payment method.</b>"
+                );
+                return;
+            }
+            if (empty($saved['autocharge'])) {
+                tgSend($token, $chatId,
+                    "⚠️ <b>Auto-charge is disabled.</b>\n\n"
+                    . "Use /autocharge to enable it, then try again."
+                );
+                return;
+            }
+            $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
+            $amount = (float)$pkg['price'];
+            $pendingRec = [
+                'txn_id'         => $txnId,
+                'chat_id'        => $chatId,
+                'user_name'      => ($profile['telegram_name'] ?? ('ID ' . $chatId)),
+                'weplay_id'      => $weplayId,
+                'coins'          => (int)$pkg['coins'],
+                'amount'         => $amount,
+                'payment_method' => 'autocharge',
+                'status'         => 'autocharge_processing',
+                'created_at'     => date('c'),
+            ];
+            wpbPendingSave($txnId, $pendingRec);
+
+            $net = $saved['network'] ? ' (' . $saved['network'] . ')' : '';
+            $l4  = $saved['last4']   ? ' •••• ' . $saved['last4']  : '';
+            tgSend($token, $chatId,
+                "⚡ <b>Auto-Charging saved card{$l4}{$net}</b>\n\n"
+                . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
+                . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
+                . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n\n"
+                . "<b>Processing…</b>"
+            );
+
+            $rzpResult = rzpChargeToken($cfg, $saved['customer_id'], $saved['token_id'], $amount, $txnId, $chatId);
+            if ($rzpResult && !empty($rzpResult['razorpay_payment_id'])) {
+                $payId = $rzpResult['razorpay_payment_id'];
+                rzpCapturePayment($cfg, $payId, $amount);
+                wpbPendingUpdate($txnId, ['rzp_payment_id' => $payId, 'status' => 'approved', 'approved_at' => date('c'), 'auto_charged' => true]);
+                wpbLedgerDeposit($chatId, $amount, $txnId, $weplayId);
+                wpbLog("Auto-charge (pkg) approved txn={$txnId} payment_id={$payId}", 'success');
+                $coinsNote = "\n<b>Coins:</b> <b>" . (int)$pkg['coins'] . " Coins</b>";
+                tgSend($token, $chatId,
+                    "✅ <b>Auto-Charge Successful!</b>\n\n"
+                    . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "{$coinsNote}\n"
+                    . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n"
+                    . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
+                    . "<b>Your WePlay account will be credited shortly.</b>"
+                );
+                wpbNotifyAdmin($cfg, $txnId);
+            } else {
+                wpbPendingUpdate($txnId, ['status' => 'autocharge_failed', 'failed_at' => date('c')]);
+                wpbLog("Auto-charge (pkg) failed txn={$txnId}", 'error');
+                // Fallback: payment link
+                $fallbackUrl  = wpbBuildCallbackUrl();
+                $payLink = rzpCreatePaymentLink($cfg, $txnId, $amount, $chatId, $weplayId, $fallbackUrl);
+                if ($payLink) {
+                    wpbPendingUpdate($txnId, ['status' => 'pending_verification', 'rzp_payment_link' => $payLink]);
+                    tgSend($token, $chatId,
+                        "⚠️ <b>Auto-charge failed.</b> Please complete payment manually:\n\n"
+                        . "👉 <a href=\"{$payLink}\">Pay ₹" . number_format($amount, 2) . "</a>\n"
+                        . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>",
+                        ['inline_keyboard' => [[['text' => '💳 Pay Now', 'url' => $payLink]]]]
+                    );
+                } else {
+                    tgSend($token, $chatId, "⚠️ <b>Auto-charge failed.</b> Contact: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+                }
+                wpbNotifyAdmin($cfg, $txnId);
+            }
+            return;
+        }
 
         // Build the recharge URL with query params for pre-fill if possible
         $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
@@ -681,6 +1114,99 @@ if (isset($_GET['webhook'])) {
     exit;
 }
 
+// ── Razorpay Webhook (server-to-server payment confirmation) ─────────────────
+if (isset($_GET['rzp_webhook'])) {
+    $rawBody  = file_get_contents('php://input');
+    $sig      = $_SERVER['HTTP_X_RAZORPAY_SIGNATURE'] ?? '';
+    $secret   = trim($cfg['razorpay_webhook_secret'] ?? '');
+    if (!rzpVerifyWebhook($rawBody, $sig, $secret)) {
+        http_response_code(400);
+        exit('Signature mismatch');
+    }
+    $event = json_decode($rawBody, true);
+    $eventName = $event['event'] ?? '';
+
+    if ($eventName === 'payment_link.paid' || $eventName === 'payment.captured') {
+        $payload = $event['payload'] ?? [];
+
+        // Extract payment and txn info
+        $paymentObj = $payload['payment']['entity'] ?? ($payload['payment_link']['entity']['payments'][0]['payment'] ?? []);
+        $notes      = $paymentObj['notes'] ?? ($payload['payment_link']['entity']['notes'] ?? []);
+        $txnId      = $notes['txn_id'] ?? '';
+        $chatId     = $notes['chat_id'] ?? '';
+        $payId      = $paymentObj['id'] ?? '';
+
+        if ($txnId && $chatId) {
+            $p = wpbPendingGet($txnId);
+            if ($p && !in_array($p['status'] ?? '', ['approved', 'rejected'])) {
+                wpbPendingUpdate($txnId, [
+                    'rzp_payment_id' => $payId,
+                    'status'         => 'approved',
+                    'approved_at'    => date('c'),
+                    'rzp_event'      => $eventName,
+                ]);
+                wpbLedgerDeposit($chatId, $p['amount'], $txnId, $p['weplay_id'] ?? '');
+                $token = trim($cfg['bot_token'] ?? '');
+                $coinsNote = !empty($p['coins']) ? "\n<b>Coins:</b> <b>" . (int)$p['coins'] . " Coins</b>" : '';
+                tgSend($token, $chatId,
+                    "✅ <b>Payment Confirmed!</b>\n\n"
+                    . "<b>💵 Amount:</b> ₹" . number_format((float)$p['amount'], 2) . "{$coinsNote}\n"
+                    . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n"
+                    . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
+                    . "<b>Your WePlay account will be credited shortly.</b>"
+                );
+                wpbNotifyAdmin($cfg, $txnId);
+                wpbLog("Razorpay webhook approved txn={$txnId} event={$eventName}", 'success');
+
+                // If user has no saved card yet, extract token and save it
+                if (!wpbGetSavedCard($chatId)) {
+                    $custId  = $paymentObj['customer_id'] ?? '';
+                    $tokId   = $paymentObj['token_id'] ?? '';
+                    $cardObj = $paymentObj['card'] ?? [];
+                    $last4   = $cardObj['last4'] ?? '';
+                    $network = $cardObj['network'] ?? '';
+                    if ($custId && $tokId) {
+                        wpbSaveSavedCard($chatId, $custId, $tokId, $last4, $network);
+                        tgSend($token, $chatId,
+                            "💾 <b>Card saved for future auto-charges!</b>\n\n"
+                            . "<b>Use /autocharge to manage your saved card and enable/disable auto-charge.</b>"
+                        );
+                        wpbLog("Saved card for chat={$chatId} token={$tokId}", 'info');
+                    }
+                }
+            }
+        }
+    }
+    http_response_code(200);
+    exit('ok');
+}
+
+// ── Razorpay redirect callback (user lands here after completing payment link) ─
+if (isset($_GET['rzp_callback'])) {
+    $txnId  = preg_replace('/[^A-Za-z0-9]/', '', $_GET['razorpay_payment_id'] ?? ($_GET['txn_id'] ?? ''));
+    $payId  = preg_replace('/[^A-Za-z0-9]/', '', $_GET['razorpay_payment_id'] ?? '');
+    $linkId = preg_replace('/[^A-Za-z0-9]/', '', $_GET['razorpay_payment_link_id'] ?? '');
+    // Find the pending record by payment link reference
+    $allPending = wpbJsonLoad(WPB_PENDING_FILE);
+    $foundTxn   = null;
+    foreach ($allPending as $tid => $pr) {
+        if (($pr['rzp_payment_link'] ?? '') && $payId && in_array($pr['status'] ?? '', ['pending_verification', 'autocharge_failed'])) {
+            // Match by notes/reference — already handled via webhook; just show a page
+            $foundTxn = $pr;
+            break;
+        }
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Complete</title>'
+        . '<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#0d1017;color:#eef3ff}'
+        . 'h1{color:#37ff8b}</style></head><body>'
+        . '<h1>✅ Payment Received!</h1>'
+        . '<p>Thank you! Your deposit is being processed.</p>'
+        . '<p>Return to the bot for confirmation.</p>'
+        . '</body></html>';
+    exit;
+}
+
 if (isset($_GET['api_action'])) {
     header('Content-Type: application/json');
     $act = preg_replace('/[^a-zA-Z0-9_]/', '', $_GET['api_action'] ?? '');
@@ -701,9 +1227,10 @@ if (isset($_GET['api_action'])) {
             $safe = $cfg; unset($safe['admin_pass']);
             echo json_encode(['ok' => true, 'data' => $safe]); exit;
         case 'save_config':
-            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice'] as $k) {
+            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','razorpay_key_id','razorpay_key_secret','razorpay_webhook_secret'] as $k) {
                 if (isset($body[$k])) $cfg[$k] = trim((string)$body[$k]);
             }
+            if (isset($body['autocharge_enabled'])) $cfg['autocharge_enabled'] = (bool)$body['autocharge_enabled'];
             if (isset($body['min_deposit'])) $cfg['min_deposit'] = max(1, (int)$body['min_deposit']);
             if (isset($body['max_deposit'])) $cfg['max_deposit'] = max($cfg['min_deposit'], (int)$body['max_deposit']);
             if (!empty($body['new_pass']) && strlen(trim($body['new_pass'])) >= 4) $cfg['admin_pass'] = trim($body['new_pass']);
@@ -745,6 +1272,27 @@ if (isset($_GET['api_action'])) {
         case 'clear_logs':
             wpbJsonSave(WPB_LOG_FILE, []);
             echo json_encode(['ok' => true]); exit;
+        case 'get_saved_cards':
+            echo json_encode(['ok' => true, 'data' => wpbJsonLoad(WPB_CARDS_FILE)]); exit;
+        case 'delete_saved_card':
+            $chatIdToRemove = (string)($body['chat_id'] ?? '');
+            if (!$chatIdToRemove) { echo json_encode(['ok' => false, 'error' => 'chat_id required']); exit; }
+            wpbDeleteSavedCard($chatIdToRemove);
+            wpbLog("Admin removed saved card for chat={$chatIdToRemove}", 'info');
+            echo json_encode(['ok' => true]); exit;
+        case 'toggle_autocharge':
+            $chatIdToToggle = (string)($body['chat_id'] ?? '');
+            $enableAC       = (bool)($body['enabled'] ?? false);
+            if (!$chatIdToToggle) { echo json_encode(['ok' => false, 'error' => 'chat_id required']); exit; }
+            $ok = wpbToggleAutoCharge($chatIdToToggle, $enableAC);
+            wpbLog("Admin toggled autocharge chat={$chatIdToToggle} enabled=" . ($enableAC ? '1' : '0'), 'info');
+            echo json_encode(['ok' => $ok]); exit;
+        case 'set_rzp_webhook':
+            if (empty($cfg['bot_token'])) { echo json_encode(['ok' => false, 'error' => 'Bot token missing']); exit; }
+            $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https://' : 'http://';
+            $rzpWhUrl = $scheme . $_SERVER['HTTP_HOST'] . strtok($_SERVER['REQUEST_URI'], '?') . '?rzp_webhook=1';
+            echo json_encode(['ok' => true, 'webhook_url' => $rzpWhUrl,
+                'note' => 'Register this URL in your Razorpay Dashboard > Webhooks. Select events: payment.captured and payment_link.paid']); exit;
         default:
             echo json_encode(['ok' => false, 'error' => 'Unknown action']); exit;
     }
@@ -796,6 +1344,28 @@ document.getElementById('pass').focus();
   </div>
 
   <div class="card">
+    <h2>⚡ Razorpay / Auto-Charge Config</h2>
+    <p class="sub">Enter your Razorpay credentials to enable automatic card payment links and one-click auto-charge for saved cards.</p>
+    <div class="row">
+      <div class="f1"><label>Razorpay Key ID</label><input id="razorpay_key_id" placeholder="rzp_live_..."></div>
+      <div class="f1"><label>Razorpay Key Secret</label><input id="razorpay_key_secret" type="password" placeholder="secret key"></div>
+    </div>
+    <div class="row">
+      <div class="f1"><label>Razorpay Webhook Secret</label><input id="razorpay_webhook_secret" type="password" placeholder="webhook signing secret"></div>
+      <div class="f1" style="display:flex;align-items:flex-end;gap:10px">
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:0;cursor:pointer">
+          <input type="checkbox" id="autocharge_enabled" style="width:auto"> Enable Auto-Charge Feature
+        </label>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn bc" onclick="saveRzpConfig()">💾 Save Razorpay Config</button>
+      <button class="btn bgr" onclick="showRzpWebhookUrl()">📋 Get Webhook URL</button>
+    </div>
+    <div id="rzp-webhook-info" style="margin-top:10px;display:none;background:var(--s2);border:1px solid var(--b);border-radius:7px;padding:10px;font-size:12px;font-family:monospace;word-break:break-all"></div>
+  </div>
+
+  <div class="card">
     <h2>🪙 Coin Packages</h2>
     <p class="sub">These appear as buttons in the bot after the user links their WePlay ID.</p>
     <div id="coin-packages-list"></div>
@@ -807,12 +1377,19 @@ document.getElementById('pass').focus();
 
   <div class="card">
     <h2>💳 Payment Methods</h2>
-    <p class="sub">These appear as buttons after user selects a coin package.</p>
+    <p class="sub">These appear as buttons after user selects a coin package. Use <code>autocharge</code> as ID for the auto-charge option.</p>
     <div id="payment-methods-list"></div>
     <div style="margin-top:10px;display:flex;gap:8px;">
       <button class="btn bg" onclick="addPayMethod()">+ Add Method</button>
       <button class="btn bc" onclick="savePayMethods()">💾 Save Methods</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>💾 Saved Cards (Auto-Charge Users)</h2>
+    <p class="sub">Users who have saved their card via Razorpay for auto-charging.</p>
+    <button class="btn bgr" onclick="loadSavedCards()">Refresh</button>
+    <div id="saved-cards" class="pending-box" style="margin-top:10px">Loading...</div>
   </div>
 
   <div class="card">
@@ -840,7 +1417,11 @@ let _payMethods=[];
 async function loadConfig(){
   const r=await fetch('?api_action=get_config').then(x=>x.json());
   if(!r.ok)return;
-  for(const [k,v] of Object.entries(r.data||{})){if(g(k)&&typeof v==='string')g(k).value=v;else if(g(k)&&typeof v==='number')g(k).value=v;}
+  for(const [k,v] of Object.entries(r.data||{})){
+    if(g(k)&&typeof v==='string')g(k).value=v;
+    else if(g(k)&&typeof v==='number')g(k).value=v;
+  }
+  if(g('autocharge_enabled'))g('autocharge_enabled').checked=!!(r.data.autocharge_enabled);
   _coinPkgs=(r.data.coin_packages||[]).map(p=>({...p}));
   _payMethods=(r.data.payment_methods||[]).map(m=>({...m}));
   renderCoinPkgs();renderPayMethods();
@@ -886,13 +1467,77 @@ async function saveConfig(){
   const p={};keys.forEach(k=>{if(g(k))p[k]=g(k).value});
   const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))
 }
+
+async function saveRzpConfig(){
+  const p={
+    razorpay_key_id:g('razorpay_key_id').value,
+    razorpay_key_secret:g('razorpay_key_secret').value,
+    razorpay_webhook_secret:g('razorpay_webhook_secret').value,
+    autocharge_enabled:g('autocharge_enabled').checked,
+  };
+  const r=await api('save_config',p);
+  toast(r.ok?'Razorpay config saved':'Error: '+(r.error||''));
+}
+
+async function showRzpWebhookUrl(){
+  const r=await api('set_rzp_webhook');
+  const box=g('rzp-webhook-info');
+  if(r.ok){
+    box.innerHTML='<b>Razorpay Webhook URL:</b><br><span style="color:var(--g)">'
+      +esc(r.webhook_url)+'</span><br><small style="color:var(--td)">'+esc(r.note||'')+'</small>';
+    box.style.display='block';
+  } else {
+    toast('Error: '+(r.error||''));
+  }
+}
+
 async function setWebhook(){const r=await api('set_webhook');toast(r.ok?'Webhook set':'Error: '+(r.error||r.tg?.description||''))}
 async function removeWebhook(){const r=await api('remove_webhook');toast(r.ok?'Webhook removed':'Error')}
 async function loadLogs(){const r=await fetch('?api_action=get_logs').then(x=>x.json());const box=g('logs');if(!r.ok||!r.data?.length){box.textContent='No logs';return}box.innerHTML=r.data.map(l=>`<div class="${l.type==='success'?'ok':l.type==='error'?'err':'info'}">[${new Date(l.time).toLocaleString()}] ${esc(l.text)}</div>`).join('')}
 async function clearLogs(){await api('clear_logs');loadLogs();toast('Logs cleared')}
-async function loadPending(){const r=await fetch('?api_action=get_pending').then(x=>x.json());const box=g('pending');const rows=Object.values(r.data||{}).reverse();if(!rows.length){box.textContent='No pending deposits';return}box.innerHTML=rows.map(p=>`<div style="border-bottom:1px solid var(--b);padding:7px 0"><b>${esc(p.txn_id)}</b> <span class="${p.status==='approved'?'ok':p.status==='rejected'?'err':'info'}">${esc(p.status)}</span><br>WePlay: ${esc(p.weplay_id)} | Coins: ${esc(p.coins||'—')} | Amount: ₹${Number(p.amount||0).toFixed(2)} | Method: ${esc(p.payment_method||'card')} | Chat: ${esc(p.chat_id)}</div>`).join('')}
+async function loadPending(){
+  const r=await fetch('?api_action=get_pending').then(x=>x.json());
+  const box=g('pending');
+  const rows=Object.values(r.data||{}).reverse();
+  if(!rows.length){box.textContent='No pending deposits';return}
+  box.innerHTML=rows.map(p=>`<div style="border-bottom:1px solid var(--b);padding:7px 0">
+    <b>${esc(p.txn_id)}</b> <span class="${p.status==='approved'?'ok':p.status==='rejected'?'err':p.status==='autocharge_processing'?'info':'info'}">${esc(p.status)}</span>
+    ${p.auto_charged?'<span style="color:var(--y)"> ⚡auto</span>':''}
+    ${p.rzp_payment_id?'<span style="color:var(--td)"> | Rzp: '+esc(p.rzp_payment_id)+'</span>':''}
+    <br>WePlay: ${esc(p.weplay_id)} | Coins: ${esc(p.coins||'—')} | Amount: ₹${Number(p.amount||0).toFixed(2)} | Method: ${esc(p.payment_method||'card')} | Chat: ${esc(p.chat_id)}
+  </div>`).join('')
+}
+
+async function loadSavedCards(){
+  const r=await fetch('?api_action=get_saved_cards').then(x=>x.json());
+  const box=g('saved-cards');
+  const rows=Object.values(r.data||{});
+  if(!rows.length){box.textContent='No saved cards';return}
+  box.innerHTML=rows.map(c=>`<div style="border-bottom:1px solid var(--b);padding:7px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span><b>Chat:</b> ${esc(c.chat_id)}</span>
+    <span><b>Card:</b> ${c.last4?'•••• '+esc(c.last4)+' ('+esc(c.network)+')':'–'}</span>
+    <span><b>Status:</b> <span class="${c.autocharge?'ok':'err'}">${c.autocharge?'⚡ Auto-ON':'⏸ Auto-OFF'}</span></span>
+    <span style="color:var(--td);font-size:11px">${new Date(c.saved_at).toLocaleString()}</span>
+    <button class="btn bgr" style="padding:4px 10px;font-size:11px" onclick="toggleAC('${esc(c.chat_id)}',${c.autocharge?'false':'true'})">${c.autocharge?'Disable':'Enable'}</button>
+    <button class="btn br" style="padding:4px 10px;font-size:11px" onclick="removeCard('${esc(c.chat_id)}')">Remove</button>
+  </div>`).join('')
+}
+
+async function toggleAC(chatId,enable){
+  const r=await api('toggle_autocharge',{chat_id:chatId,enabled:enable==='true'||enable===true});
+  toast(r.ok?'Updated':'Error');
+  loadSavedCards();
+}
+
+async function removeCard(chatId){
+  if(!confirm('Remove saved card for chat '+chatId+'?'))return;
+  const r=await api('delete_saved_card',{chat_id:chatId});
+  toast(r.ok?'Removed':'Error');
+  loadSavedCards();
+}
+
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
-loadConfig();loadLogs();loadPending();
+loadConfig();loadLogs();loadPending();loadSavedCards();
 </script>
 </body>
 </html>
