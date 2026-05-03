@@ -10,7 +10,7 @@
  * Setup:
  *   1. Is file ko server pe upload karo.
  *   2. Browser mein kholo -> admin panel.
- *   3. Bot token, admin chat ID, UPI details aur WePlay recharge link set karo.
+ *   3. Bot token, admin chat ID, and WePlay recharge/payment link set karo.
  *   4. "Set Webhook" dabao.
  *   5. Users ko bot link bhejo. Ve /Deposit se payment request bana sakte hain.
  *
@@ -32,19 +32,14 @@ define('WPB_LEDGER_FILE',  __DIR__ . '/wpb_ledger.json');
 define('WPB_PENDING_FILE', __DIR__ . '/wpb_pending.json');
 define('WPB_PROFILE_FILE', __DIR__ . '/wpb_profiles.json');
 define('WPB_RATE_FILE',    __DIR__ . '/wpb_ratelimit.json');
-define('WPB_QR_DIR',       __DIR__ . '/wpb_qr/');
 define('TG_BASE',          'https://api.telegram.org/bot');
 define('WPB_BLOCK_MINUTES', 30);
 define('WPB_MAX_INCOMPLETE', 2);
-
-if (!is_dir(WPB_QR_DIR)) @mkdir(WPB_QR_DIR, 0755, true);
 
 $defaultConfig = [
     'admin_pass'       => 'rebel@2026',
     'bot_token'        => '',
     'admin_chat_id'    => '',
-    'upi_id'           => '',
-    'upi_name'         => 'WePlay Recharge',
     'min_deposit'      => 100,
     'max_deposit'      => 100000,
     'weplay_site'      => 'https://weplayapp.com',
@@ -224,66 +219,6 @@ function tgSend($token, $chatId, $text, $keyboard = null) {
     return tg('sendMessage', $params, $token);
 }
 
-function tgSendPhoto($token, $chatId, $photoPath, $caption = '', $keyboard = null) {
-    if (!$token || !$chatId || !file_exists($photoPath)) return ['ok' => false];
-    $fields = [
-        'chat_id' => $chatId,
-        'caption' => $caption,
-        'parse_mode' => 'HTML',
-        'photo' => new CURLFile($photoPath, 'image/png', 'qr.png'),
-    ];
-    if ($keyboard) $fields['reply_markup'] = json_encode($keyboard);
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL => TG_BASE . $token . '/sendPhoto',
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_TIMEOUT => 40,
-        CURLOPT_POSTFIELDS => $fields,
-    ]);
-    $raw = curl_exec($ch);
-    curl_close($ch);
-    return json_decode($raw, true) ?: [];
-}
-
-function wpbQr($upiString, $outputFile) {
-    $apis = [
-        'https://api.qrserver.com/v1/create-qr-code/?size=450x450&data=' . urlencode($upiString),
-        'https://quickchart.io/qr?size=450&text=' . urlencode($upiString),
-    ];
-    foreach ($apis as $url) {
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 15,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_FOLLOWLOCATION => true,
-        ]);
-        $data = curl_exec($ch);
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $ct = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-        curl_close($ch);
-        if ($code === 200 && $data && (stripos((string)$ct, 'image') !== false || strlen($data) > 1000)) {
-            file_put_contents($outputFile, $data);
-            return file_exists($outputFile) && filesize($outputFile) > 500;
-        }
-    }
-    return false;
-}
-
-function wpbUpiString($cfg, $amount, $txnId) {
-    $pa = trim($cfg['upi_id'] ?? '');
-    $pn = trim($cfg['upi_name'] ?? 'WePlay Recharge');
-    return 'upi://pay?pa=' . rawurlencode($pa)
-        . '&pn=' . rawurlencode($pn)
-        . '&am=' . rawurlencode(number_format((float)$amount, 2, '.', ''))
-        . '&cu=INR&tn=' . rawurlencode('WePlay deposit ' . $txnId);
-}
-
 function wpbUserName($msg) {
     $from = $msg['from'] ?? [];
     if (!empty($from['username'])) return '@' . $from['username'];
@@ -327,22 +262,16 @@ function wpbPaymentKeyboard($cfg) {
     return $buttons ? ['inline_keyboard' => $buttons] : null;
 }
 
-function wpbPaymentMethodKeyboard() {
-    return ['inline_keyboard' => [[
-        ['text' => '🏦 UPI', 'callback_data' => 'paymethod:upi'],
-        ['text' => '💳 Card', 'callback_data' => 'paymethod:card'],
-    ]]];
-}
-
-function wpbAskPaymentMethod($cfg, $chatId, $token, $weplayId) {
-    wpbSetState($chatId, 'await_method', ['weplay_id' => $weplayId]);
+function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
+    wpbSetState($chatId, 'await_amount', ['weplay_id' => $weplayId, 'payment_method' => 'card']);
     tgSend(
         $token,
         $chatId,
-        "💳 <b>Please select a payment method.</b>\n\n"
+        "💳 <b>Card payment selected.</b>\n\n"
         . "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-        . "<b>Choose Card if you want to pay by credit/debit card.</b>",
-        wpbPaymentMethodKeyboard()
+        . "<b>Please send the deposit amount.</b>\n\n"
+        . "<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n"
+        . "<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']
     );
 }
 
@@ -374,7 +303,7 @@ function wpbHandleDepositCommand($cfg, $chatId, $token) {
     }
     $profile = wpbGetProfile($chatId);
     if (!empty($profile['weplay_id'])) {
-        wpbAskPaymentMethod($cfg, $chatId, $token, $profile['weplay_id']);
+        wpbStartCardDeposit($cfg, $chatId, $token, $profile['weplay_id']);
         return;
     }
 
@@ -445,7 +374,7 @@ function wpbHandleText($cfg, $msg) {
             return;
         }
         $data['weplay_id'] = $text;
-        wpbAskPaymentMethod($cfg, $chatId, $token, $data['weplay_id']);
+        wpbStartCardDeposit($cfg, $chatId, $token, $data['weplay_id']);
         return;
     }
 
@@ -460,11 +389,6 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
 
-    if ($s === 'await_method') {
-        tgSend($token, $chatId, "💳 <b>Please select UPI or Card using the buttons above.</b>");
-        return;
-    }
-
     if ($s === 'await_amount') {
         $amount = (float)preg_replace('/[^0-9.]/', '', $text);
         if ($amount < (float)$cfg['min_deposit'] || $amount > (float)$cfg['max_deposit']) {
@@ -472,76 +396,34 @@ function wpbHandleText($cfg, $msg) {
             return;
         }
         $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
-        $method = strtolower($data['payment_method'] ?? 'upi');
-        if ($method === 'card') {
-            $pending = [
-                'txn_id' => $txnId,
-                'chat_id' => $chatId,
-                'user_name' => wpbUserName($msg),
-                'weplay_id' => $data['weplay_id'] ?? '',
-                'amount' => $amount,
-                'payment_method' => 'card',
-                'status' => 'pending_verification',
-                'created_at' => date('c'),
-            ];
-            wpbPendingSave($txnId, $pending);
-            wpbClearState($chatId);
-            wpbDepositCompleted($chatId);
-            $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
-            tgSend(
-                $token,
-                $chatId,
-                "💳 <b>Card Payment Selected</b>\n\n"
-                . "<b>🎮 WePlay ID:</b> <code>" . htmlspecialchars($pending['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
-                . "<b>💵 Amount:</b> <b>₹" . number_format($amount, 2) . "</b>\n"
-                . "<b>🧾 Transaction ID:</b> <code>{$txnId}</code>\n\n"
-                . "<b>Open the secure WePlay/payment gateway page below and enter your card details there.</b>\n"
-                . $cardNotice . "\n\n"
-                . "<b>After payment is completed, the admin will verify it and you will receive a success notification.</b>",
-                wpbPaymentKeyboard($cfg)
-            );
-            wpbNotifyAdmin($cfg, $txnId);
-            wpbLog("Card deposit request txn={$txnId} chat={$chatId} amount={$amount}", 'success');
-            return;
-        }
-
-        $qrFile = WPB_QR_DIR . $txnId . '.png';
-        $upi = wpbUpiString($cfg, $amount, $txnId);
-        if (!trim($cfg['upi_id'] ?? '')) {
-            tgSend($token, $chatId, "⚠️ <b>UPI setup is pending. Please contact the admin or choose Card payment.</b>");
-            return;
-        }
-        if (!wpbQr($upi, $qrFile)) {
-            tgSend($token, $chatId, "❌ <b>Unable to generate the QR code. Please contact the admin.</b>");
-            wpbLog("QR failed for {$txnId}", 'error');
-            return;
-        }
         $pending = [
             'txn_id' => $txnId,
             'chat_id' => $chatId,
             'user_name' => wpbUserName($msg),
             'weplay_id' => $data['weplay_id'] ?? '',
             'amount' => $amount,
-            'payment_method' => 'upi',
+            'payment_method' => 'card',
             'status' => 'pending_verification',
             'created_at' => date('c'),
         ];
         wpbPendingSave($txnId, $pending);
         wpbClearState($chatId);
         wpbDepositCompleted($chatId);
-        $keyboard = ['inline_keyboard' => [[
-            ['text' => '🌐 Open WePlay Recharge', 'url' => $cfg['weplay_recharge']],
-        ]]];
-        $caption = "💰 <b>WePlay Deposit</b>\n\n"
+        $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
+        tgSend(
+            $token,
+            $chatId,
+            "💳 <b>Card Payment Selected</b>\n\n"
             . "<b>🎮 WePlay ID:</b> <code>" . htmlspecialchars($pending['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
             . "<b>💵 Amount:</b> <b>₹" . number_format($amount, 2) . "</b>\n"
             . "<b>🧾 Transaction ID:</b> <code>{$txnId}</code>\n\n"
-            . "<b>UPI:</b> <code>" . htmlspecialchars($cfg['upi_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-            . "<b>After payment is completed, the admin will verify it.</b>";
-        tgSendPhoto($token, $chatId, $qrFile, $caption, $keyboard);
-        tgSend($token, $chatId, $cfg['deposit_thanks']);
+            . "<b>Open the secure WePlay/payment gateway page below and enter your card details there.</b>\n"
+            . $cardNotice . "\n\n"
+            . "<b>After payment is completed, the admin will verify it and you will receive a success notification.</b>",
+            wpbPaymentKeyboard($cfg)
+        );
         wpbNotifyAdmin($cfg, $txnId);
-        wpbLog("Deposit QR sent txn={$txnId} chat={$chatId} amount={$amount}", 'success');
+        wpbLog("Card deposit request txn={$txnId} chat={$chatId} amount={$amount}", 'success');
         return;
     }
 
@@ -579,7 +461,7 @@ function wpbNotifyAdmin($cfg, $txnId) {
         . "<b>Chat ID:</b> <code>" . htmlspecialchars((string)$p['chat_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . "<b>WePlay ID:</b> <code>" . htmlspecialchars($p['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . "<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n"
-        . "<b>Payment Method:</b> <b>" . strtoupper(htmlspecialchars($p['payment_method'] ?? 'upi', ENT_NOQUOTES, 'UTF-8')) . "</b>\n"
+        . "<b>Payment Method:</b> <b>" . strtoupper(htmlspecialchars($p['payment_method'] ?? 'card', ENT_NOQUOTES, 'UTF-8')) . "</b>\n"
         . "\n<b>Verify the payment from the WePlay/payment dashboard, then approve or reject.</b>\n"
         . "<b>Recharge link:</b> " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
     tgSend($token, $admin, $msg, wpbAdminButtons($txnId));
@@ -589,28 +471,6 @@ function wpbHandleCallback($cfg, $cb) {
     $token = trim($cfg['bot_token'] ?? '');
     $data = $cb['data'] ?? '';
     $cbId = $cb['id'] ?? '';
-
-    if (preg_match('/^paymethod:(upi|card)$/', $data, $m)) {
-        $chatId = $cb['message']['chat']['id'] ?? '';
-        $state = $chatId ? wpbGetState($chatId) : null;
-        if (!$chatId || !$state || ($state['state'] ?? '') !== 'await_method') {
-            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Please start /Deposit again.', 'show_alert' => true], $token);
-            return;
-        }
-        $stateData = $state['data'] ?? [];
-        $stateData['payment_method'] = $m[1];
-        wpbSetState($chatId, 'await_amount', $stateData);
-        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => strtoupper($m[1]) . ' selected'], $token);
-        tgSend(
-            $token,
-            $chatId,
-            "<b>" . strtoupper($m[1]) . " payment selected.</b>\n\n"
-            . "<b>Please send the deposit amount.</b>\n\n"
-            . "<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n"
-            . "<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']
-        );
-        return;
-    }
 
     $admin = (string)($cfg['admin_chat_id'] ?? '');
     $fromId = (string)($cb['from']['id'] ?? '');
@@ -683,7 +543,7 @@ if (isset($_GET['api_action'])) {
             $safe = $cfg; unset($safe['admin_pass']);
             echo json_encode(['ok' => true, 'data' => $safe]); exit;
         case 'save_config':
-            foreach (['bot_token','admin_chat_id','upi_id','upi_name','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice'] as $k) {
+            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice'] as $k) {
                 if (isset($body[$k])) $cfg[$k] = trim((string)$body[$k]);
             }
             if (isset($body['min_deposit'])) $cfg['min_deposit'] = max(1, (int)$body['min_deposit']);
@@ -748,7 +608,6 @@ document.getElementById('pass').focus();
   <div class="card">
     <h2>⚙️ Config</h2>
     <div class="row"><div class="f1"><label>Bot Token</label><input id="bot_token" type="password"></div><div class="f1"><label>Admin Chat ID</label><input id="admin_chat_id"></div></div>
-    <div class="row"><div class="f1"><label>UPI ID</label><input id="upi_id" placeholder="name@upi"></div><div class="f1"><label>UPI Name</label><input id="upi_name"></div></div>
     <div class="row"><div class="f1"><label>Min Deposit</label><input id="min_deposit" type="number"></div><div class="f1"><label>Max Deposit</label><input id="max_deposit" type="number"></div></div>
     <div class="row"><div class="f1"><label>WePlay Site</label><input id="weplay_site"></div><div class="f1"><label>WePlay Recharge Link</label><input id="weplay_recharge"></div></div>
     <div class="row"><div class="f1"><label>Support Contact</label><input id="support_contact"></div><div class="f1"><label>Change Admin Password</label><input id="new_pass" type="password" placeholder="blank = no change"></div></div>
@@ -778,7 +637,7 @@ function g(id){return document.getElementById(id)}
 function toast(msg){const t=g('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 async function api(action,payload={}){return fetch('?api_action='+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(x=>x.json()).catch(e=>({ok:false,error:String(e)}))}
 async function loadConfig(){const r=await fetch('?api_action=get_config').then(x=>x.json());if(!r.ok)return;for(const [k,v] of Object.entries(r.data||{})){if(g(k))g(k).value=v}}
-async function saveConfig(){const keys=['bot_token','admin_chat_id','upi_id','upi_name','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','new_pass'];const p={};keys.forEach(k=>p[k]=g(k).value);const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))}
+async function saveConfig(){const keys=['bot_token','admin_chat_id','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','new_pass'];const p={};keys.forEach(k=>p[k]=g(k).value);const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))}
 async function setWebhook(){const r=await api('set_webhook');toast(r.ok?'Webhook set':'Error: '+(r.error||r.tg?.description||''))}
 async function removeWebhook(){const r=await api('remove_webhook');toast(r.ok?'Webhook removed':'Error')}
 async function loadLogs(){const r=await fetch('?api_action=get_logs').then(x=>x.json());const box=g('logs');if(!r.ok||!r.data?.length){box.textContent='No logs';return}box.innerHTML=r.data.map(l=>`<div class="${l.type==='success'?'ok':l.type==='error'?'err':'info'}">[${new Date(l.time).toLocaleString()}] ${esc(l.text)}</div>`).join('')}
