@@ -30,6 +30,7 @@ define('WPB_LOG_FILE',     __DIR__ . '/wpb_logs.json');
 define('WPB_STATE_FILE',   __DIR__ . '/wpb_states.json');
 define('WPB_LEDGER_FILE',  __DIR__ . '/wpb_ledger.json');
 define('WPB_PENDING_FILE', __DIR__ . '/wpb_pending.json');
+define('WPB_PROFILE_FILE', __DIR__ . '/wpb_profiles.json');
 define('WPB_RATE_FILE',    __DIR__ . '/wpb_ratelimit.json');
 define('WPB_QR_DIR',       __DIR__ . '/wpb_qr/');
 define('TG_BASE',          'https://api.telegram.org/bot');
@@ -49,8 +50,9 @@ $defaultConfig = [
     'weplay_site'      => 'https://weplayapp.com',
     'weplay_recharge'  => 'https://weplayapp.com/recharge/?region=C',
     'support_contact'  => '@Rebel_babyyy',
-    'welcome_msg'      => "🎮 <b>WePlay Deposit Bot</b>\n\n💰 /Deposit - Deposit request\n💸 /Withdrawal - Withdrawal request\n💳 /Balance - Balance check\n❓ /Help - Help",
+    'welcome_msg'      => "🎮 <b>WePlay Deposit Bot</b>\n\n🆔 /id - WePlay ID link/payment section\n💰 /Deposit - Deposit request\n💳 /pay - Open secure payment section\n💸 /Withdrawal - Withdrawal request\n💳 /Balance - Balance check\n❓ /Help - Help",
     'deposit_thanks'   => "✅ <b>Deposit submitted!</b>\n\nAdmin verify karke WePlay account me credit karega.",
+    'card_notice'      => "🔐 Card details bot me mat bhejo. Card number/CVV sirf official WePlay/payment gateway page par fill karo.",
 ];
 
 function wpbLoadConfig() {
@@ -178,6 +180,22 @@ function wpbLedgerWithdrawal($chatId, $amount, $weplayId) {
     wpbJsonSave(WPB_LEDGER_FILE, $ledger, true);
 }
 
+function wpbGetProfile($chatId) {
+    $profiles = wpbJsonLoad(WPB_PROFILE_FILE);
+    return $profiles[(string)$chatId] ?? ['chat_id' => $chatId, 'weplay_id' => '', 'updated_at' => null];
+}
+
+function wpbSaveProfile($chatId, $weplayId, $userName = '') {
+    $profiles = wpbJsonLoad(WPB_PROFILE_FILE);
+    $profiles[(string)$chatId] = [
+        'chat_id' => $chatId,
+        'weplay_id' => trim($weplayId),
+        'telegram_name' => $userName,
+        'updated_at' => date('c'),
+    ];
+    wpbJsonSave(WPB_PROFILE_FILE, $profiles, true);
+}
+
 function tg($method, $params, $token) {
     $ch = curl_init();
     curl_setopt_array($ch, [
@@ -299,6 +317,33 @@ function wpbAdminButtons($txnId) {
     ]]];
 }
 
+function wpbPaymentKeyboard($cfg) {
+    $buttons = [];
+    if (!empty($cfg['weplay_recharge'])) {
+        $buttons[] = [['text' => '💳 Open Secure WePlay Payment', 'url' => $cfg['weplay_recharge']]];
+    }
+    if (!empty($cfg['weplay_site'])) {
+        $buttons[] = [['text' => '🎮 Open WePlay', 'url' => $cfg['weplay_site']]];
+    }
+    return $buttons ? ['inline_keyboard' => $buttons] : null;
+}
+
+function wpbShowPaymentSection($cfg, $chatId, $token) {
+    $profile = wpbGetProfile($chatId);
+    if (empty($profile['weplay_id'])) {
+        wpbSetState($chatId, 'await_link_id', []);
+        tgSend($token, $chatId, "🆔 Pehle apna <b>WePlay User ID / Username</b> bhejo.\n\nExample: <code>12345678</code>\nCancel ke liye /cancel bhejo.");
+        return;
+    }
+
+    $msg = "🎮 <b>WePlay Payment Section</b>\n\n"
+        . "Linked WePlay ID: <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
+        . "💳 Credit/debit card payment ke liye neeche official secure page open karo.\n"
+        . htmlspecialchars($cfg['card_notice'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n\n"
+        . "Payment complete hone ke baad success screenshot/UTR bot me bhej sakte ho ya /Deposit se request create kar sakte ho.";
+    tgSend($token, $chatId, $msg, wpbPaymentKeyboard($cfg));
+}
+
 function wpbHandleDepositCommand($cfg, $chatId, $token) {
     if ($blocked = wpbIsBlocked($chatId)) {
         tgSend($token, $chatId, "⏳ Aap temporary blocked ho.\nPlease " . wpbRemaining($blocked) . " baad try karo.");
@@ -312,8 +357,15 @@ function wpbHandleDepositCommand($cfg, $chatId, $token) {
         tgSend($token, $chatId, "⚠️ Bahut saare incomplete deposits detect hue. Please " . WPB_BLOCK_MINUTES . " minutes baad try karo.");
         return;
     }
+    $profile = wpbGetProfile($chatId);
+    if (!empty($profile['weplay_id'])) {
+        wpbSetState($chatId, 'await_amount', ['weplay_id' => $profile['weplay_id']]);
+        tgSend($token, $chatId, "🎮 Linked WePlay ID: <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n💰 Deposit amount bhejo.\n\nMinimum: ₹" . (int)$cfg['min_deposit'] . "\nMaximum: ₹" . (int)$cfg['max_deposit']);
+        return;
+    }
+
     wpbSetState($chatId, 'await_weplay_id', []);
-    tgSend($token, $chatId, "🎮 Apna <b>WePlay User ID / Username</b> bhejo.\n\nCancel ke liye /cancel bhejo.");
+    tgSend($token, $chatId, "🎮 Apna <b>WePlay User ID / Username</b> bhejo.\n\nTip: /id se ID permanently link kar sakte ho.\nCancel ke liye /cancel bhejo.");
 }
 
 function wpbHandleText($cfg, $msg) {
@@ -328,7 +380,7 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
     if (strcasecmp($text, '/help') === 0) {
-        tgSend($token, $chatId, "❓ <b>Help</b>\n\n/Deposit - Deposit QR banao\n/Withdrawal - Withdrawal request\n/Balance - Local balance\n/cancel - Current process cancel\n\nSupport: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+        tgSend($token, $chatId, "❓ <b>Help</b>\n\n/id - WePlay ID link/payment section\n/pay - Secure WePlay payment page\n/Deposit - Deposit QR banao\n/Withdrawal - Withdrawal request\n/Balance - Local balance\n/cancel - Current process cancel\n\nSupport: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
         return;
     }
     if (strcasecmp($text, '/cancel') === 0) {
@@ -338,6 +390,20 @@ function wpbHandleText($cfg, $msg) {
     }
     if (strcasecmp($text, '/deposit') === 0) {
         wpbHandleDepositCommand($cfg, $chatId, $token);
+        return;
+    }
+    if (strcasecmp($text, '/id') === 0) {
+        $profile = wpbGetProfile($chatId);
+        if (!empty($profile['weplay_id'])) {
+            tgSend($token, $chatId, "✅ Linked WePlay ID: <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\nNayi ID link karne ke liye abhi nayi WePlay ID bhejo, ya /pay se payment section open karo.", wpbPaymentKeyboard($cfg));
+        } else {
+            tgSend($token, $chatId, "🆔 Apna <b>WePlay User ID / Username</b> bhejo.\n\nIske baad bot payment section reflect karega.");
+        }
+        wpbSetState($chatId, 'await_link_id', []);
+        return;
+    }
+    if (strcasecmp($text, '/pay') === 0) {
+        wpbShowPaymentSection($cfg, $chatId, $token);
         return;
     }
     if (strcasecmp($text, '/balance') === 0) {
@@ -367,6 +433,17 @@ function wpbHandleText($cfg, $msg) {
         $data['weplay_id'] = $text;
         wpbSetState($chatId, 'await_amount', $data);
         tgSend($token, $chatId, "💰 Deposit amount bhejo.\n\nMinimum: ₹" . (int)$cfg['min_deposit'] . "\nMaximum: ₹" . (int)$cfg['max_deposit']);
+        return;
+    }
+
+    if ($s === 'await_link_id') {
+        if (mb_strlen($text) < 2) {
+            tgSend($token, $chatId, "Valid WePlay ID bhejo.");
+            return;
+        }
+        wpbSaveProfile($chatId, $text, wpbUserName($msg));
+        wpbClearState($chatId);
+        tgSend($token, $chatId, "✅ WePlay ID linked: <code>" . htmlspecialchars($text, ENT_NOQUOTES, 'UTF-8') . "</code>\n\nAb payment section open kar sakte ho. Card details sirf official secure page par fill karo.", wpbPaymentKeyboard($cfg));
         return;
     }
 
@@ -567,7 +644,7 @@ if (isset($_GET['api_action'])) {
             $safe = $cfg; unset($safe['admin_pass']);
             echo json_encode(['ok' => true, 'data' => $safe]); exit;
         case 'save_config':
-            foreach (['bot_token','admin_chat_id','upi_id','upi_name','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks'] as $k) {
+            foreach (['bot_token','admin_chat_id','upi_id','upi_name','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice'] as $k) {
                 if (isset($body[$k])) $cfg[$k] = trim((string)$body[$k]);
             }
             if (isset($body['min_deposit'])) $cfg['min_deposit'] = max(1, (int)$body['min_deposit']);
@@ -637,6 +714,7 @@ document.getElementById('pass').focus();
     <div class="row"><div class="f1"><label>WePlay Site</label><input id="weplay_site"></div><div class="f1"><label>WePlay Recharge Link</label><input id="weplay_recharge"></div></div>
     <div class="row"><div class="f1"><label>Support Contact</label><input id="support_contact"></div><div class="f1"><label>Change Admin Password</label><input id="new_pass" type="password" placeholder="blank = no change"></div></div>
     <div class="row"><div class="f1"><label>Welcome Message</label><textarea id="welcome_msg"></textarea></div><div class="f1"><label>Deposit Thanks Message</label><textarea id="deposit_thanks"></textarea></div></div>
+    <div class="row"><div class="f1"><label>Card Safety Notice</label><textarea id="card_notice"></textarea></div></div>
     <button class="btn bc" onclick="saveConfig()">💾 Save</button>
     <button class="btn bg" onclick="setWebhook()">🔗 Set Webhook</button>
     <button class="btn br" onclick="removeWebhook()">Remove Webhook</button>
@@ -661,7 +739,7 @@ function g(id){return document.getElementById(id)}
 function toast(msg){const t=g('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 async function api(action,payload={}){return fetch('?api_action='+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(x=>x.json()).catch(e=>({ok:false,error:String(e)}))}
 async function loadConfig(){const r=await fetch('?api_action=get_config').then(x=>x.json());if(!r.ok)return;for(const [k,v] of Object.entries(r.data||{})){if(g(k))g(k).value=v}}
-async function saveConfig(){const keys=['bot_token','admin_chat_id','upi_id','upi_name','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','new_pass'];const p={};keys.forEach(k=>p[k]=g(k).value);const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))}
+async function saveConfig(){const keys=['bot_token','admin_chat_id','upi_id','upi_name','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','new_pass'];const p={};keys.forEach(k=>p[k]=g(k).value);const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))}
 async function setWebhook(){const r=await api('set_webhook');toast(r.ok?'Webhook set':'Error: '+(r.error||r.tg?.description||''))}
 async function removeWebhook(){const r=await api('remove_webhook');toast(r.ok?'Webhook removed':'Error')}
 async function loadLogs(){const r=await fetch('?api_action=get_logs').then(x=>x.json());const box=g('logs');if(!r.ok||!r.data?.length){box.textContent='No logs';return}box.innerHTML=r.data.map(l=>`<div class="${l.type==='success'?'ok':l.type==='error'?'err':'info'}">[${new Date(l.time).toLocaleString()}] ${esc(l.text)}</div>`).join('')}
