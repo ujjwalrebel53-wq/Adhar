@@ -50,9 +50,9 @@ $defaultConfig = [
     'weplay_site'      => 'https://weplayapp.com',
     'weplay_recharge'  => 'https://weplayapp.com/recharge/?region=C',
     'support_contact'  => '@Rebel_babyyy',
-    'welcome_msg'      => "🎮 <b>WePlay Deposit Bot</b>\n\n🆔 /id - WePlay ID link/payment section\n💰 /Deposit - Deposit request\n💳 /pay - Open secure payment section\n💸 /Withdrawal - Withdrawal request\n💳 /Balance - Balance check\n❓ /Help - Help",
-    'deposit_thanks'   => "✅ <b>Deposit submitted!</b>\n\nAdmin verify karke WePlay account me credit karega.",
-    'card_notice'      => "🔐 Card details bot me mat bhejo. Card number/CVV sirf official WePlay/payment gateway page par fill karo.",
+    'welcome_msg'      => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id - Link your WePlay ID and open the payment section</b>\n<b>💰 /Deposit - Create a deposit request</b>\n<b>💳 /pay - Open the secure payment section</b>\n<b>💸 /Withdrawal - Create a withdrawal request</b>\n<b>💳 /Balance - Check your balance</b>\n<b>❓ /Help - Show help</b>",
+    'deposit_thanks'   => "✅ <b>Deposit submitted!</b>\n\n<b>The admin will verify the payment and credit your WePlay account.</b>",
+    'card_notice'      => "🔐 <b>Do not send card details in this bot. Enter card number/CVV only on the official WePlay/payment gateway page.</b>",
 ];
 
 function wpbLoadConfig() {
@@ -331,40 +331,41 @@ function wpbShowPaymentSection($cfg, $chatId, $token) {
     $profile = wpbGetProfile($chatId);
     if (empty($profile['weplay_id'])) {
         wpbSetState($chatId, 'await_link_id', []);
-        tgSend($token, $chatId, "🆔 Pehle apna <b>WePlay User ID / Username</b> bhejo.\n\nExample: <code>12345678</code>\nCancel ke liye /cancel bhejo.");
+        tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username first.</b>\n\n<b>Example:</b> <code>12345678</code>\n<b>Send /cancel to cancel.</b>");
         return;
     }
 
+    $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
     $msg = "🎮 <b>WePlay Payment Section</b>\n\n"
-        . "Linked WePlay ID: <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-        . "💳 Credit/debit card payment ke liye neeche official secure page open karo.\n"
-        . htmlspecialchars($cfg['card_notice'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n\n"
-        . "Payment complete hone ke baad admin payment dashboard me verify karega.";
+        . "<b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
+        . "<b>💳 For credit/debit card payment, open the official secure page below.</b>\n"
+        . $cardNotice . "\n\n"
+        . "<b>After payment is completed, the admin will verify it in the payment dashboard.</b>";
     tgSend($token, $chatId, $msg, wpbPaymentKeyboard($cfg));
 }
 
 function wpbHandleDepositCommand($cfg, $chatId, $token) {
     if ($blocked = wpbIsBlocked($chatId)) {
-        tgSend($token, $chatId, "⏳ Aap temporary blocked ho.\nPlease " . wpbRemaining($blocked) . " baad try karo.");
+        tgSend($token, $chatId, "⏳ <b>You are temporarily blocked.</b>\n<b>Please try again after " . wpbRemaining($blocked) . ".</b>");
         return;
     }
     if (!trim($cfg['upi_id'] ?? '')) {
-        tgSend($token, $chatId, "⚠️ UPI setup pending hai. Admin se contact karo.");
+        tgSend($token, $chatId, "⚠️ <b>UPI setup is pending. Please contact the admin.</b>");
         return;
     }
     if (!wpbStartDeposit($chatId)) {
-        tgSend($token, $chatId, "⚠️ Bahut saare incomplete deposits detect hue. Please " . WPB_BLOCK_MINUTES . " minutes baad try karo.");
+        tgSend($token, $chatId, "⚠️ <b>Too many incomplete deposits were detected. Please try again after " . WPB_BLOCK_MINUTES . " minutes.</b>");
         return;
     }
     $profile = wpbGetProfile($chatId);
     if (!empty($profile['weplay_id'])) {
         wpbSetState($chatId, 'await_amount', ['weplay_id' => $profile['weplay_id']]);
-        tgSend($token, $chatId, "🎮 Linked WePlay ID: <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n💰 Deposit amount bhejo.\n\nMinimum: ₹" . (int)$cfg['min_deposit'] . "\nMaximum: ₹" . (int)$cfg['max_deposit']);
+        tgSend($token, $chatId, "🎮 <b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>💰 Please send the deposit amount.</b>\n\n<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']);
         return;
     }
 
     wpbSetState($chatId, 'await_weplay_id', []);
-    tgSend($token, $chatId, "🎮 Apna <b>WePlay User ID / Username</b> bhejo.\n\nTip: /id se ID permanently link kar sakte ho.\nCancel ke liye /cancel bhejo.");
+    tgSend($token, $chatId, "🎮 <b>Please send your WePlay User ID / Username.</b>\n\n<b>Tip: Use /id to link your ID permanently.</b>\n<b>Send /cancel to cancel.</b>");
 }
 
 function wpbHandleText($cfg, $msg) {
@@ -379,12 +380,12 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
     if (strcasecmp($text, '/help') === 0) {
-        tgSend($token, $chatId, "❓ <b>Help</b>\n\n/id - WePlay ID link/payment section\n/pay - Secure WePlay payment page\n/Deposit - Deposit QR banao\n/Withdrawal - Withdrawal request\n/Balance - Local balance\n/cancel - Current process cancel\n\nSupport: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+        tgSend($token, $chatId, "❓ <b>Help</b>\n\n<b>/id - Link your WePlay ID and open the payment section</b>\n<b>/pay - Open the secure WePlay payment page</b>\n<b>/Deposit - Create a deposit request</b>\n<b>/Withdrawal - Create a withdrawal request</b>\n<b>/Balance - Check your local balance</b>\n<b>/cancel - Cancel the current process</b>\n\n<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
         return;
     }
     if (strcasecmp($text, '/cancel') === 0) {
         wpbClearState($chatId);
-        tgSend($token, $chatId, "✅ Cancelled.");
+        tgSend($token, $chatId, "✅ <b>Cancelled.</b>");
         return;
     }
     if (strcasecmp($text, '/deposit') === 0) {
@@ -394,9 +395,9 @@ function wpbHandleText($cfg, $msg) {
     if (strcasecmp($text, '/id') === 0) {
         $profile = wpbGetProfile($chatId);
         if (!empty($profile['weplay_id'])) {
-            tgSend($token, $chatId, "✅ Linked WePlay ID: <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\nNayi ID link karne ke liye abhi nayi WePlay ID bhejo, ya /pay se payment section open karo.", wpbPaymentKeyboard($cfg));
+            tgSend($token, $chatId, "✅ <b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>Send a new WePlay ID now to replace it, or use /pay to open the payment section.</b>", wpbPaymentKeyboard($cfg));
         } else {
-            tgSend($token, $chatId, "🆔 Apna <b>WePlay User ID / Username</b> bhejo.\n\nIske baad bot payment section reflect karega.");
+            tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username.</b>\n\n<b>After this, the bot will show the payment section.</b>");
         }
         wpbSetState($chatId, 'await_link_id', []);
         return;
@@ -407,17 +408,17 @@ function wpbHandleText($cfg, $msg) {
     }
     if (strcasecmp($text, '/balance') === 0) {
         $user = wpbLedgerUser($chatId);
-        tgSend($token, $chatId, "💳 <b>Your Balance</b>\n\nAmount: <b>₹" . number_format((float)$user['balance'], 2) . "</b>");
+        tgSend($token, $chatId, "💳 <b>Your Balance</b>\n\n<b>Amount:</b> <b>₹" . number_format((float)$user['balance'], 2) . "</b>");
         return;
     }
     if (strcasecmp($text, '/withdrawal') === 0) {
         wpbSetState($chatId, 'withdraw_weplay_id', []);
-        tgSend($token, $chatId, "🎮 Withdrawal ke liye apna <b>WePlay User ID / Username</b> bhejo.");
+        tgSend($token, $chatId, "🎮 <b>Please send your WePlay User ID / Username for withdrawal.</b>");
         return;
     }
 
     if (!$state) {
-        tgSend($token, $chatId, "Command samajh nahi aaya. /Deposit, /Withdrawal, /Balance ya /Help use karo.");
+        tgSend($token, $chatId, "❓ <b>Command not recognized. Please use /Deposit, /Withdrawal, /Balance, /id, /pay, or /Help.</b>");
         return;
     }
 
@@ -426,37 +427,37 @@ function wpbHandleText($cfg, $msg) {
 
     if ($s === 'await_weplay_id') {
         if (mb_strlen($text) < 2) {
-            tgSend($token, $chatId, "Valid WePlay ID bhejo.");
+            tgSend($token, $chatId, "⚠️ <b>Please send a valid WePlay ID.</b>");
             return;
         }
         $data['weplay_id'] = $text;
         wpbSetState($chatId, 'await_amount', $data);
-        tgSend($token, $chatId, "💰 Deposit amount bhejo.\n\nMinimum: ₹" . (int)$cfg['min_deposit'] . "\nMaximum: ₹" . (int)$cfg['max_deposit']);
+        tgSend($token, $chatId, "💰 <b>Please send the deposit amount.</b>\n\n<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']);
         return;
     }
 
     if ($s === 'await_link_id') {
         if (mb_strlen($text) < 2) {
-            tgSend($token, $chatId, "Valid WePlay ID bhejo.");
+            tgSend($token, $chatId, "⚠️ <b>Please send a valid WePlay ID.</b>");
             return;
         }
         wpbSaveProfile($chatId, $text, wpbUserName($msg));
         wpbClearState($chatId);
-        tgSend($token, $chatId, "✅ WePlay ID linked: <code>" . htmlspecialchars($text, ENT_NOQUOTES, 'UTF-8') . "</code>\n\nAb payment section open kar sakte ho. Card details sirf official secure page par fill karo.", wpbPaymentKeyboard($cfg));
+        tgSend($token, $chatId, "✅ <b>WePlay ID linked:</b> <code>" . htmlspecialchars($text, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>You can now open the payment section. Enter card details only on the official secure page.</b>", wpbPaymentKeyboard($cfg));
         return;
     }
 
     if ($s === 'await_amount') {
         $amount = (float)preg_replace('/[^0-9.]/', '', $text);
         if ($amount < (float)$cfg['min_deposit'] || $amount > (float)$cfg['max_deposit']) {
-            tgSend($token, $chatId, "❌ Amount ₹" . (int)$cfg['min_deposit'] . " se ₹" . (int)$cfg['max_deposit'] . " ke beech hona chahiye.");
+            tgSend($token, $chatId, "❌ <b>The amount must be between ₹" . (int)$cfg['min_deposit'] . " and ₹" . (int)$cfg['max_deposit'] . ".</b>");
             return;
         }
         $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
         $qrFile = WPB_QR_DIR . $txnId . '.png';
         $upi = wpbUpiString($cfg, $amount, $txnId);
         if (!wpbQr($upi, $qrFile)) {
-            tgSend($token, $chatId, "❌ QR generate nahi ho paya. Admin se contact karo.");
+            tgSend($token, $chatId, "❌ <b>Unable to generate the QR code. Please contact the admin.</b>");
             wpbLog("QR failed for {$txnId}", 'error');
             return;
         }
@@ -476,11 +477,11 @@ function wpbHandleText($cfg, $msg) {
             ['text' => '🌐 Open WePlay Recharge', 'url' => $cfg['weplay_recharge']],
         ]]];
         $caption = "💰 <b>WePlay Deposit</b>\n\n"
-            . "🎮 WePlay ID: <code>" . htmlspecialchars($pending['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
-            . "💵 Amount: <b>₹" . number_format($amount, 2) . "</b>\n"
-            . "🧾 Transaction ID: <code>{$txnId}</code>\n\n"
-            . "UPI: <code>" . htmlspecialchars($cfg['upi_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-            . "Payment complete hone ke baad admin verify karega.";
+            . "<b>🎮 WePlay ID:</b> <code>" . htmlspecialchars($pending['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+            . "<b>💵 Amount:</b> <b>₹" . number_format($amount, 2) . "</b>\n"
+            . "<b>🧾 Transaction ID:</b> <code>{$txnId}</code>\n\n"
+            . "<b>UPI:</b> <code>" . htmlspecialchars($cfg['upi_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
+            . "<b>After payment is completed, the admin will verify it.</b>";
         tgSendPhoto($token, $chatId, $qrFile, $caption, $keyboard);
         tgSend($token, $chatId, $cfg['deposit_thanks']);
         wpbNotifyAdmin($cfg, $txnId);
@@ -491,21 +492,21 @@ function wpbHandleText($cfg, $msg) {
     if ($s === 'withdraw_weplay_id') {
         $data['weplay_id'] = $text;
         wpbSetState($chatId, 'withdraw_amount', $data);
-        tgSend($token, $chatId, "💸 Withdrawal amount bhejo.");
+        tgSend($token, $chatId, "💸 <b>Please send the withdrawal amount.</b>");
         return;
     }
 
     if ($s === 'withdraw_amount') {
         $amount = (float)preg_replace('/[^0-9.]/', '', $text);
         if ($amount <= 0) {
-            tgSend($token, $chatId, "Valid amount bhejo.");
+            tgSend($token, $chatId, "⚠️ <b>Please send a valid amount.</b>");
             return;
         }
         wpbLedgerWithdrawal($chatId, $amount, $data['weplay_id'] ?? '');
         wpbClearState($chatId);
-        tgSend($token, $chatId, "✅ Withdrawal request submitted.\nSupport: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+        tgSend($token, $chatId, "✅ <b>Withdrawal request submitted.</b>\n<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
         if (!empty($cfg['admin_chat_id'])) {
-            tgSend($token, $cfg['admin_chat_id'], "💸 <b>Withdrawal Request</b>\n\nUser: " . htmlspecialchars(wpbUserName($msg), ENT_NOQUOTES, 'UTF-8') . "\nChat ID: <code>{$chatId}</code>\nWePlay ID: <code>" . htmlspecialchars($data['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\nAmount: <b>₹" . number_format($amount, 2) . "</b>");
+            tgSend($token, $cfg['admin_chat_id'], "💸 <b>Withdrawal Request</b>\n\n<b>User:</b> " . htmlspecialchars(wpbUserName($msg), ENT_NOQUOTES, 'UTF-8') . "\n<b>Chat ID:</b> <code>{$chatId}</code>\n<b>WePlay ID:</b> <code>" . htmlspecialchars($data['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n<b>Amount:</b> <b>₹" . number_format($amount, 2) . "</b>");
         }
         return;
     }
@@ -517,13 +518,13 @@ function wpbNotifyAdmin($cfg, $txnId) {
     $p = wpbPendingGet($txnId);
     if (!$token || !$admin || !$p) return;
     $msg = "🧾 <b>WePlay Deposit Submitted</b>\n\n"
-        . "Txn: <code>{$txnId}</code>\n"
-        . "User: " . htmlspecialchars($p['user_name'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n"
-        . "Chat ID: <code>" . htmlspecialchars((string)$p['chat_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
-        . "WePlay ID: <code>" . htmlspecialchars($p['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n"
-        . "Amount: <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n"
-        . "\nVerify payment from WePlay/payment dashboard, then approve or reject.\n"
-        . "Recharge link: " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
+        . "<b>Txn:</b> <code>{$txnId}</code>\n"
+        . "<b>User:</b> " . htmlspecialchars($p['user_name'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n"
+        . "<b>Chat ID:</b> <code>" . htmlspecialchars((string)$p['chat_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+        . "<b>WePlay ID:</b> <code>" . htmlspecialchars($p['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+        . "<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n"
+        . "\n<b>Verify the payment from the WePlay/payment dashboard, then approve or reject.</b>\n"
+        . "<b>Recharge link:</b> " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
     tgSend($token, $admin, $msg, wpbAdminButtons($txnId));
 }
 
@@ -552,12 +553,12 @@ function wpbHandleCallback($cfg, $cb) {
     if ($action === 'approve') {
         wpbPendingUpdate($txnId, ['status' => 'approved', 'approved_at' => date('c')]);
         wpbLedgerDeposit($p['chat_id'], $p['amount'], $txnId, $p['weplay_id'] ?? '');
-        tgSend($token, $p['chat_id'], "✅ <b>Deposit Approved!</b>\n\nAmount: <b>₹" . number_format((float)$p['amount'], 2) . "</b>\nTxn: <code>{$txnId}</code>");
+        tgSend($token, $p['chat_id'], "✅ <b>Deposit Approved!</b>\n\n<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n<b>Txn:</b> <code>{$txnId}</code>");
         tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Approved'], $token);
         wpbLog("Approved txn={$txnId}", 'success');
     } else {
         wpbPendingUpdate($txnId, ['status' => 'rejected', 'rejected_at' => date('c')]);
-        tgSend($token, $p['chat_id'], "❌ <b>Deposit Rejected</b>\n\nTxn: <code>{$txnId}</code>\nSupport: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+        tgSend($token, $p['chat_id'], "❌ <b>Deposit Rejected</b>\n\n<b>Txn:</b> <code>{$txnId}</code>\n<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
         tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Rejected'], $token);
         wpbLog("Rejected txn={$txnId}", 'error');
     }
