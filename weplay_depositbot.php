@@ -52,7 +52,7 @@ $defaultConfig = [
     'card_charge_url'  => '',
     'card_charge_method' => 'POST',
     'card_charge_headers' => "Content-Type: application/json",
-    'card_charge_body' => "{\"txn_id\":\"{txn_id}\",\"amount\":{amount},\"weplay_id\":\"{weplay_id}\",\"chat_id\":\"{chat_id}\",\"callback_url\":\"{callback_url}\"}",
+    'card_charge_body' => "{\"txn_id\":{txn_id_json},\"amount\":{amount},\"weplay_id\":{weplay_id_json},\"chat_id\":{chat_id_json},\"callback_url\":{callback_url_json}}",
     'card_charge_link_path' => 'payment_url',
     'card_charge_status_path' => 'status',
     'card_webhook_secret' => '',
@@ -296,10 +296,20 @@ function wpbCurrentUrl($extraQuery = []) {
 
 function wpbTemplate($template, $vars) {
     foreach ($vars as $key => $value) {
+        $template = str_replace('{json:' . $key . '}', json_encode($value, JSON_UNESCAPED_UNICODE), $template);
         if (is_array($value)) $value = json_encode($value, JSON_UNESCAPED_UNICODE);
         $template = str_replace('{' . $key . '}', (string)$value, $template);
     }
     return $template;
+}
+
+function wpbTemplateVars($vars) {
+    foreach ($vars as $key => $value) {
+        if (is_scalar($value) || $value === null) {
+            $vars[$key . '_json'] = json_encode($value, JSON_UNESCAPED_UNICODE);
+        }
+    }
+    return $vars;
 }
 
 function wpbHeaderLines($headersText) {
@@ -352,11 +362,11 @@ function wpbCreateCardCharge($cfg, $txnId, $pending) {
 
     $callbackQuery = ['card_webhook' => 1];
     if (!empty($cfg['card_webhook_secret'])) $callbackQuery['secret'] = $cfg['card_webhook_secret'];
-    $vars = array_merge($pending, [
+    $vars = wpbTemplateVars(array_merge($pending, [
         'txn_id' => $txnId,
         'amount' => number_format((float)($pending['amount'] ?? 0), 2, '.', ''),
         'callback_url' => wpbCurrentUrl($callbackQuery),
-    ]);
+    ]));
 
     $method = strtoupper(trim((string)($cfg['card_charge_method'] ?? 'POST'))) ?: 'POST';
     $body = wpbTemplate((string)($cfg['card_charge_body'] ?? ''), $vars);
@@ -420,7 +430,10 @@ function wpbHandleCardWebhook($cfg) {
 
     $raw = file_get_contents('php://input');
     $payload = json_decode($raw ?: '', true);
-    if (!is_array($payload)) $payload = $_POST;
+    if (!is_array($payload) || !$payload) {
+        $payload = array_merge($_GET, $_POST);
+        unset($payload['card_webhook'], $payload['secret']);
+    }
 
     $txnId = wpbJsonPath($payload, $cfg['card_webhook_txn_path'] ?? 'txn_id');
     $status = wpbJsonPath($payload, $cfg['card_webhook_status_path'] ?? 'status');
