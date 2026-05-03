@@ -48,6 +48,16 @@ $defaultConfig = [
     'welcome_msg'      => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id &lt;your-id&gt; — Link your WePlay ID &amp; open recharge</b>\n<b>💰 /Deposit — Create a deposit request</b>\n<b>💳 /pay — Open the secure payment section</b>\n<b>💸 /Withdrawal — Create a withdrawal request</b>\n<b>💳 /Balance — Check your balance</b>\n<b>❓ /Help — Show help</b>",
     'deposit_thanks'   => "✅ <b>Deposit submitted!</b>\n\n<b>The admin will verify the payment and credit your WePlay account.</b>",
     'card_notice'      => "🔐 <b>Do not send card details in this bot. Enter card number/CVV only on the official WePlay/payment gateway page.</b>",
+    'auto_card_charge' => false,
+    'card_charge_url'  => '',
+    'card_charge_method' => 'POST',
+    'card_charge_headers' => "Content-Type: application/json",
+    'card_charge_body' => "{\"txn_id\":\"{txn_id}\",\"amount\":{amount},\"weplay_id\":\"{weplay_id}\",\"chat_id\":\"{chat_id}\",\"callback_url\":\"{callback_url}\"}",
+    'card_charge_link_path' => 'payment_url',
+    'card_charge_status_path' => 'status',
+    'card_webhook_secret' => '',
+    'card_webhook_txn_path' => 'txn_id',
+    'card_webhook_status_path' => 'status',
     // Each package: label shown on button, coins, price (INR)
     'coin_packages'    => [
         ['label' => '60 Coins — ₹80',   'coins' => 60,   'price' => 80],
@@ -256,6 +266,190 @@ function wpbPendingUpdate($txnId, $data) {
     $pending[$txnId] = array_merge($pending[$txnId], $data);
     wpbJsonSave(WPB_PENDING_FILE, $pending, true);
     return true;
+}
+
+function wpbBool($value) {
+    if (is_bool($value)) return $value;
+    return in_array(strtolower(trim((string)$value)), ['1', 'true', 'yes', 'on'], true);
+}
+
+function wpbJsonPath($data, $path) {
+    $path = trim((string)$path);
+    if ($path === '') return $data;
+    foreach (explode('.', $path) as $part) {
+        if (is_array($data) && array_key_exists($part, $data)) {
+            $data = $data[$part];
+        } elseif (is_array($data) && ctype_digit($part) && array_key_exists((int)$part, $data)) {
+            $data = $data[(int)$part];
+        } else {
+            return null;
+        }
+    }
+    return $data;
+}
+
+function wpbCurrentUrl($extraQuery = []) {
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https://' : 'http://';
+    $base = $scheme . ($_SERVER['HTTP_HOST'] ?? '') . strtok($_SERVER['REQUEST_URI'] ?? '', '?');
+    return $base . ($extraQuery ? ('?' . http_build_query($extraQuery)) : '');
+}
+
+function wpbTemplate($template, $vars) {
+    foreach ($vars as $key => $value) {
+        if (is_array($value)) $value = json_encode($value, JSON_UNESCAPED_UNICODE);
+        $template = str_replace('{' . $key . '}', (string)$value, $template);
+    }
+    return $template;
+}
+
+function wpbHeaderLines($headersText) {
+    $headers = [];
+    foreach (explode("\n", (string)$headersText) as $line) {
+        $line = trim($line);
+        if ($line !== '' && strpos($line, ':') !== false) $headers[] = $line;
+    }
+    return $headers;
+}
+
+function wpbIsPaidStatus($status) {
+    return in_array(strtolower(trim((string)$status)), ['paid', 'succeeded', 'success', 'approved', 'captured', 'complete', 'completed'], true);
+}
+
+function wpbIsFailedStatus($status) {
+    return in_array(strtolower(trim((string)$status)), ['failed', 'failure', 'declined', 'cancelled', 'canceled', 'rejected', 'expired'], true);
+}
+
+function wpbPaymentLinkKeyboard($url, $label = '💳 Complete Secure Card Payment') {
+    return $url ? ['inline_keyboard' => [[['text' => $label, 'url' => $url]]]] : null;
+}
+
+function wpbApprovePending($cfg, $txnId, $p, $source = 'admin') {
+    if (($p['status'] ?? '') === 'approved') return ['ok' => false, 'message' => 'Already approved'];
+    if (($p['status'] ?? '') === 'rejected') return ['ok' => false, 'message' => 'Already rejected'];
+    wpbPendingUpdate($txnId, ['status' => 'approved', 'approved_at' => date('c'), 'approved_by' => $source]);
+    wpbLedgerDeposit($p['chat_id'], $p['amount'], $txnId, $p['weplay_id'] ?? '');
+    $token = trim($cfg['bot_token'] ?? '');
+    $coinsNote = !empty($p['coins']) ? "\n<b>Coins:</b> <b>" . (int)$p['coins'] . " Coins</b>" : '';
+    tgSend($token, $p['chat_id'], "✅ <b>Deposit Approved!</b>\n\n<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>{$coinsNote}\n<b>Txn:</b> <code>{$txnId}</code>");
+    wpbLog("Approved txn={$txnId} source={$source}", 'success');
+    return ['ok' => true, 'message' => 'Approved'];
+}
+
+function wpbRejectPending($cfg, $txnId, $p, $source = 'admin') {
+    if (($p['status'] ?? '') === 'approved') return ['ok' => false, 'message' => 'Already approved'];
+    if (($p['status'] ?? '') === 'rejected') return ['ok' => false, 'message' => 'Already rejected'];
+    wpbPendingUpdate($txnId, ['status' => 'rejected', 'rejected_at' => date('c'), 'rejected_by' => $source]);
+    $token = trim($cfg['bot_token'] ?? '');
+    tgSend($token, $p['chat_id'], "❌ <b>Deposit Rejected</b>\n\n<b>Txn:</b> <code>{$txnId}</code>\n<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+    wpbLog("Rejected txn={$txnId} source={$source}", 'error');
+    return ['ok' => true, 'message' => 'Rejected'];
+}
+
+function wpbCreateCardCharge($cfg, $txnId, $pending) {
+    if (!wpbBool($cfg['auto_card_charge'] ?? false) || empty($cfg['card_charge_url'])) {
+        return ['enabled' => false];
+    }
+
+    $callbackQuery = ['card_webhook' => 1];
+    if (!empty($cfg['card_webhook_secret'])) $callbackQuery['secret'] = $cfg['card_webhook_secret'];
+    $vars = array_merge($pending, [
+        'txn_id' => $txnId,
+        'amount' => number_format((float)($pending['amount'] ?? 0), 2, '.', ''),
+        'callback_url' => wpbCurrentUrl($callbackQuery),
+    ]);
+
+    $method = strtoupper(trim((string)($cfg['card_charge_method'] ?? 'POST'))) ?: 'POST';
+    $body = wpbTemplate((string)($cfg['card_charge_body'] ?? ''), $vars);
+    $headers = wpbHeaderLines($cfg['card_charge_headers'] ?? '');
+    $ch = curl_init();
+    $opts = [
+        CURLOPT_URL => $cfg['card_charge_url'],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_HTTPHEADER => $headers,
+    ];
+    if ($method === 'POST') {
+        $opts[CURLOPT_POST] = true;
+        $opts[CURLOPT_POSTFIELDS] = $body;
+    } elseif ($method !== 'GET') {
+        $opts[CURLOPT_CUSTOMREQUEST] = $method;
+        if ($body !== '') $opts[CURLOPT_POSTFIELDS] = $body;
+    }
+    curl_setopt_array($ch, $opts);
+    $raw = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+
+    $json = json_decode($raw ?: '', true);
+    $status = is_array($json) ? wpbJsonPath($json, $cfg['card_charge_status_path'] ?? 'status') : null;
+    $paymentUrl = is_array($json) ? wpbJsonPath($json, $cfg['card_charge_link_path'] ?? 'payment_url') : null;
+    wpbPendingUpdate($txnId, [
+        'charge_http_code' => $code,
+        'charge_status' => $status,
+        'charge_payment_url' => is_scalar($paymentUrl) ? (string)$paymentUrl : '',
+        'charge_response_at' => date('c'),
+    ]);
+
+    if ($err || $code < 200 || $code >= 300) {
+        wpbLog("Card charge failed txn={$txnId} http={$code} error={$err}", 'error');
+        return ['enabled' => true, 'ok' => false, 'error' => $err ?: ('HTTP ' . $code)];
+    }
+    if (wpbIsPaidStatus($status)) {
+        $fresh = wpbPendingGet($txnId) ?: $pending;
+        wpbApprovePending($cfg, $txnId, $fresh, 'card_gateway');
+    } elseif (wpbIsFailedStatus($status)) {
+        $fresh = wpbPendingGet($txnId) ?: $pending;
+        wpbRejectPending($cfg, $txnId, $fresh, 'card_gateway');
+    }
+
+    return ['enabled' => true, 'ok' => true, 'status' => $status, 'payment_url' => is_scalar($paymentUrl) ? (string)$paymentUrl : ''];
+}
+
+function wpbHandleCardWebhook($cfg) {
+    if (!empty($cfg['card_webhook_secret'])) {
+        $provided = (string)($_GET['secret'] ?? $_SERVER['HTTP_X_WPB_CARD_SECRET'] ?? '');
+        if (!hash_equals((string)$cfg['card_webhook_secret'], $provided)) {
+            http_response_code(403);
+            echo json_encode(['ok' => false, 'error' => 'Invalid webhook secret']);
+            return;
+        }
+    }
+
+    $raw = file_get_contents('php://input');
+    $payload = json_decode($raw ?: '', true);
+    if (!is_array($payload)) $payload = $_POST;
+
+    $txnId = wpbJsonPath($payload, $cfg['card_webhook_txn_path'] ?? 'txn_id');
+    $status = wpbJsonPath($payload, $cfg['card_webhook_status_path'] ?? 'status');
+    $txnId = is_scalar($txnId) ? trim((string)$txnId) : '';
+    $statusText = is_scalar($status) ? trim((string)$status) : '';
+    $pending = $txnId !== '' ? wpbPendingGet($txnId) : null;
+
+    if (!$pending) {
+        http_response_code(404);
+        echo json_encode(['ok' => false, 'error' => 'Transaction not found']);
+        return;
+    }
+
+    wpbPendingUpdate($txnId, [
+        'gateway_status' => $statusText,
+        'gateway_webhook_at' => date('c'),
+    ]);
+    $pending = wpbPendingGet($txnId) ?: $pending;
+
+    if (wpbIsPaidStatus($statusText)) {
+        $result = wpbApprovePending($cfg, $txnId, $pending, 'card_webhook');
+    } elseif (wpbIsFailedStatus($statusText)) {
+        $result = wpbRejectPending($cfg, $txnId, $pending, 'card_webhook');
+    } else {
+        wpbLog("Card webhook txn={$txnId} status={$statusText}", 'info');
+        $result = ['ok' => true, 'message' => 'Status recorded'];
+    }
+
+    echo json_encode(['ok' => $result['ok'], 'message' => $result['message']]);
 }
 
 function wpbAdminButtons($txnId) {
@@ -481,6 +675,15 @@ function wpbHandleText($cfg, $msg) {
         wpbClearState($chatId);
         wpbDepositCompleted($chatId);
         $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
+        $charge = wpbCreateCardCharge($cfg, $txnId, $pending);
+        $payUrl = $charge['payment_url'] ?? '';
+        $keyboard = $payUrl ? wpbPaymentLinkKeyboard($payUrl) : wpbPaymentKeyboard($cfg);
+        $afterText = !empty($charge['enabled'])
+            ? "<b>Use the secure payment button below. Once the gateway confirms payment, your deposit will be approved automatically.</b>"
+            : "<b>After payment is completed, the admin will verify it and you will receive a success notification.</b>";
+        if (!empty($charge['enabled']) && empty($charge['ok'])) {
+            $afterText = "<b>Automatic charge could not be started right now. Please use the fallback payment link below; admin verification will still be available.</b>";
+        }
         tgSend(
             $token,
             $chatId,
@@ -488,10 +691,10 @@ function wpbHandleText($cfg, $msg) {
             . "<b>🎮 WePlay ID:</b> <code>" . htmlspecialchars($pending['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
             . "<b>💵 Amount:</b> <b>₹" . number_format($amount, 2) . "</b>\n"
             . "<b>🧾 Transaction ID:</b> <code>{$txnId}</code>\n\n"
-            . "<b>Open the secure WePlay/payment gateway page below and enter your card details there.</b>\n"
+            . "<b>Open the secure payment page below and enter your card details there.</b>\n"
             . $cardNotice . "\n\n"
-            . "<b>After payment is completed, the admin will verify it and you will receive a success notification.</b>",
-            wpbPaymentKeyboard($cfg)
+            . $afterText,
+            $keyboard
         );
         wpbNotifyAdmin($cfg, $txnId);
         wpbLog("Card deposit request txn={$txnId} chat={$chatId} amount={$amount}", 'success');
@@ -592,21 +795,6 @@ function wpbHandleCallback($cfg, $cb) {
         $profile = wpbGetProfile($chatId);
         $weplayId = $profile['weplay_id'] ?? '';
 
-        // Build the recharge URL with query params for pre-fill if possible
-        $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
-
-        $msg = "✅ <b>Payment Method Selected</b>\n\n"
-            . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
-            . "💳 <b>Method:</b> " . htmlspecialchars($method['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
-            . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
-            . "\n<b>🔗 Open the link below to complete your payment:</b>\n\n"
-            . htmlspecialchars($cfg['card_notice'] ?? '', ENT_NOQUOTES, 'UTF-8');
-
-        $keyboard = ['inline_keyboard' => [
-            [['text' => '💳 Complete Payment on WePlay', 'url' => $rechargeUrl]],
-        ]];
-        tgSend($token, $chatId, $msg, $keyboard);
-
         // Create a pending deposit record so admin can verify
         if (!empty($weplayId)) {
             $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
@@ -622,8 +810,30 @@ function wpbHandleCallback($cfg, $cb) {
                 'created_at'     => date('c'),
             ];
             wpbPendingSave($txnId, $pending);
+            $charge = ($methodId === 'card') ? wpbCreateCardCharge($cfg, $txnId, $pending) : ['enabled' => false];
+            $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
+            $payUrl = $charge['payment_url'] ?? '';
+            $keyboard = $payUrl ? wpbPaymentLinkKeyboard($payUrl) : ['inline_keyboard' => [[['text' => '💳 Complete Payment on WePlay', 'url' => $rechargeUrl]]]];
+            $cardNotice = htmlspecialchars($cfg['card_notice'] ?? '', ENT_NOQUOTES, 'UTF-8');
+            $autoLine = ($methodId === 'card' && !empty($charge['enabled']))
+                ? "\n<b>Gateway confirmation will approve the deposit automatically.</b>"
+                : "\n<b>Admin will verify the payment after completion.</b>";
+            if ($methodId === 'card' && !empty($charge['enabled']) && empty($charge['ok'])) {
+                $autoLine = "\n<b>Automatic charge could not be started right now. Use the fallback payment link; admin verification remains available.</b>";
+            }
+            $msg = "✅ <b>Payment Method Selected</b>\n\n"
+                . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
+                . "💳 <b>Method:</b> " . htmlspecialchars($method['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
+                . "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+                . "<b>Txn:</b> <code>{$txnId}</code>\n"
+                . "\n<b>🔗 Open the secure link below to complete your payment:</b>\n\n"
+                . $cardNotice
+                . $autoLine;
+            tgSend($token, $chatId, $msg, $keyboard);
             wpbNotifyAdmin($cfg, $txnId);
             wpbLog("Deposit via pkg {$pkgIndex} method={$methodId} txn={$txnId} chat={$chatId}", 'success');
+        } else {
+            tgSend($token, $chatId, "⚠️ <b>Please link your WePlay ID first with /id.</b>");
         }
         return;
     }
@@ -648,17 +858,11 @@ function wpbHandleCallback($cfg, $cb) {
         return;
     }
     if ($action === 'approve') {
-        wpbPendingUpdate($txnId, ['status' => 'approved', 'approved_at' => date('c')]);
-        wpbLedgerDeposit($p['chat_id'], $p['amount'], $txnId, $p['weplay_id'] ?? '');
-        $coinsNote = !empty($p['coins']) ? "\n<b>Coins:</b> <b>" . (int)$p['coins'] . " Coins</b>" : '';
-        tgSend($token, $p['chat_id'], "✅ <b>Deposit Approved!</b>\n\n<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>{$coinsNote}\n<b>Txn:</b> <code>{$txnId}</code>");
+        wpbApprovePending($cfg, $txnId, $p, 'admin');
         tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Approved'], $token);
-        wpbLog("Approved txn={$txnId}", 'success');
     } else {
-        wpbPendingUpdate($txnId, ['status' => 'rejected', 'rejected_at' => date('c')]);
-        tgSend($token, $p['chat_id'], "❌ <b>Deposit Rejected</b>\n\n<b>Txn:</b> <code>{$txnId}</code>\n<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
+        wpbRejectPending($cfg, $txnId, $p, 'admin');
         tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Rejected'], $token);
-        wpbLog("Rejected txn={$txnId}", 'error');
     }
 }
 
@@ -678,6 +882,12 @@ if (isset($_GET['webhook'])) {
         }
     }
     http_response_code(200);
+    exit;
+}
+
+if (isset($_GET['card_webhook'])) {
+    header('Content-Type: application/json');
+    wpbHandleCardWebhook($cfg);
     exit;
 }
 
@@ -701,9 +911,10 @@ if (isset($_GET['api_action'])) {
             $safe = $cfg; unset($safe['admin_pass']);
             echo json_encode(['ok' => true, 'data' => $safe]); exit;
         case 'save_config':
-            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice'] as $k) {
+            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','card_charge_url','card_charge_method','card_charge_headers','card_charge_body','card_charge_link_path','card_charge_status_path','card_webhook_secret','card_webhook_txn_path','card_webhook_status_path'] as $k) {
                 if (isset($body[$k])) $cfg[$k] = trim((string)$body[$k]);
             }
+            if (isset($body['auto_card_charge'])) $cfg['auto_card_charge'] = wpbBool($body['auto_card_charge']);
             if (isset($body['min_deposit'])) $cfg['min_deposit'] = max(1, (int)$body['min_deposit']);
             if (isset($body['max_deposit'])) $cfg['max_deposit'] = max($cfg['min_deposit'], (int)$body['max_deposit']);
             if (!empty($body['new_pass']) && strlen(trim($body['new_pass'])) >= 4) $cfg['admin_pass'] = trim($body['new_pass']);
@@ -790,6 +1001,11 @@ document.getElementById('pass').focus();
     <div class="row"><div class="f1"><label>Support Contact</label><input id="support_contact"></div><div class="f1"><label>Change Admin Password</label><input id="new_pass" type="password" placeholder="blank = no change"></div></div>
     <div class="row"><div class="f1"><label>Welcome Message</label><textarea id="welcome_msg"></textarea></div><div class="f1"><label>Deposit Thanks Message</label><textarea id="deposit_thanks"></textarea></div></div>
     <div class="row"><div class="f1"><label>Card Safety Notice</label><textarea id="card_notice"></textarea></div></div>
+    <div class="row"><div class="f1"><label><input id="auto_card_charge" type="checkbox" style="width:auto;margin-right:6px">Enable Automated Card Charging</label><p class="sub">Bot sends a secure gateway request and auto-approves paid webhooks. Card details must stay on the gateway page.</p></div><div class="f1"><label>Gateway Charge URL</label><input id="card_charge_url" placeholder="https://gateway.example/charges"></div></div>
+    <div class="row"><div class="f1"><label>Gateway Method</label><input id="card_charge_method" placeholder="POST"></div><div class="f1"><label>Webhook Secret</label><input id="card_webhook_secret" type="password" placeholder="optional shared secret"></div></div>
+    <div class="row"><div class="f1"><label>Gateway Headers (one per line)</label><textarea id="card_charge_headers"></textarea></div><div class="f1"><label>Gateway Request Body Template</label><textarea id="card_charge_body"></textarea></div></div>
+    <div class="row"><div class="f1"><label>Payment URL JSON Path</label><input id="card_charge_link_path" placeholder="payment_url"></div><div class="f1"><label>Charge Status JSON Path</label><input id="card_charge_status_path" placeholder="status"></div></div>
+    <div class="row"><div class="f1"><label>Webhook Transaction JSON Path</label><input id="card_webhook_txn_path" placeholder="txn_id"></div><div class="f1"><label>Webhook Status JSON Path</label><input id="card_webhook_status_path" placeholder="status"></div></div>
     <button class="btn bc" onclick="saveConfig()">💾 Save</button>
     <button class="btn bg" onclick="setWebhook()">🔗 Set Webhook</button>
     <button class="btn br" onclick="removeWebhook()">Remove Webhook</button>
@@ -841,6 +1057,7 @@ async function loadConfig(){
   const r=await fetch('?api_action=get_config').then(x=>x.json());
   if(!r.ok)return;
   for(const [k,v] of Object.entries(r.data||{})){if(g(k)&&typeof v==='string')g(k).value=v;else if(g(k)&&typeof v==='number')g(k).value=v;}
+  if(g('auto_card_charge'))g('auto_card_charge').checked=!!r.data.auto_card_charge;
   _coinPkgs=(r.data.coin_packages||[]).map(p=>({...p}));
   _payMethods=(r.data.payment_methods||[]).map(m=>({...m}));
   renderCoinPkgs();renderPayMethods();
@@ -882,8 +1099,9 @@ async function savePayMethods(){
 }
 
 async function saveConfig(){
-  const keys=['bot_token','admin_chat_id','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','new_pass'];
+  const keys=['bot_token','admin_chat_id','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','new_pass','card_charge_url','card_charge_method','card_charge_headers','card_charge_body','card_charge_link_path','card_charge_status_path','card_webhook_secret','card_webhook_txn_path','card_webhook_status_path'];
   const p={};keys.forEach(k=>{if(g(k))p[k]=g(k).value});
+  if(g('auto_card_charge'))p.auto_card_charge=g('auto_card_charge').checked;
   const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))
 }
 async function setWebhook(){const r=await api('set_webhook');toast(r.ok?'Webhook set':'Error: '+(r.error||r.tg?.description||''))}
