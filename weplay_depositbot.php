@@ -327,6 +327,25 @@ function wpbPaymentKeyboard($cfg) {
     return $buttons ? ['inline_keyboard' => $buttons] : null;
 }
 
+function wpbPaymentMethodKeyboard() {
+    return ['inline_keyboard' => [[
+        ['text' => '🏦 UPI', 'callback_data' => 'paymethod:upi'],
+        ['text' => '💳 Card', 'callback_data' => 'paymethod:card'],
+    ]]];
+}
+
+function wpbAskPaymentMethod($cfg, $chatId, $token, $weplayId) {
+    wpbSetState($chatId, 'await_method', ['weplay_id' => $weplayId]);
+    tgSend(
+        $token,
+        $chatId,
+        "💳 <b>Please select a payment method.</b>\n\n"
+        . "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
+        . "<b>Choose Card if you want to pay by credit/debit card.</b>",
+        wpbPaymentMethodKeyboard()
+    );
+}
+
 function wpbShowPaymentSection($cfg, $chatId, $token) {
     $profile = wpbGetProfile($chatId);
     if (empty($profile['weplay_id'])) {
@@ -349,18 +368,13 @@ function wpbHandleDepositCommand($cfg, $chatId, $token) {
         tgSend($token, $chatId, "⏳ <b>You are temporarily blocked.</b>\n<b>Please try again after " . wpbRemaining($blocked) . ".</b>");
         return;
     }
-    if (!trim($cfg['upi_id'] ?? '')) {
-        tgSend($token, $chatId, "⚠️ <b>UPI setup is pending. Please contact the admin.</b>");
-        return;
-    }
     if (!wpbStartDeposit($chatId)) {
         tgSend($token, $chatId, "⚠️ <b>Too many incomplete deposits were detected. Please try again after " . WPB_BLOCK_MINUTES . " minutes.</b>");
         return;
     }
     $profile = wpbGetProfile($chatId);
     if (!empty($profile['weplay_id'])) {
-        wpbSetState($chatId, 'await_amount', ['weplay_id' => $profile['weplay_id']]);
-        tgSend($token, $chatId, "🎮 <b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>💰 Please send the deposit amount.</b>\n\n<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']);
+        wpbAskPaymentMethod($cfg, $chatId, $token, $profile['weplay_id']);
         return;
     }
 
@@ -431,8 +445,7 @@ function wpbHandleText($cfg, $msg) {
             return;
         }
         $data['weplay_id'] = $text;
-        wpbSetState($chatId, 'await_amount', $data);
-        tgSend($token, $chatId, "💰 <b>Please send the deposit amount.</b>\n\n<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']);
+        wpbAskPaymentMethod($cfg, $chatId, $token, $data['weplay_id']);
         return;
     }
 
@@ -447,6 +460,11 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
 
+    if ($s === 'await_method') {
+        tgSend($token, $chatId, "💳 <b>Please select UPI or Card using the buttons above.</b>");
+        return;
+    }
+
     if ($s === 'await_amount') {
         $amount = (float)preg_replace('/[^0-9.]/', '', $text);
         if ($amount < (float)$cfg['min_deposit'] || $amount > (float)$cfg['max_deposit']) {
@@ -454,8 +472,45 @@ function wpbHandleText($cfg, $msg) {
             return;
         }
         $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
+        $method = strtolower($data['payment_method'] ?? 'upi');
+        if ($method === 'card') {
+            $pending = [
+                'txn_id' => $txnId,
+                'chat_id' => $chatId,
+                'user_name' => wpbUserName($msg),
+                'weplay_id' => $data['weplay_id'] ?? '',
+                'amount' => $amount,
+                'payment_method' => 'card',
+                'status' => 'pending_verification',
+                'created_at' => date('c'),
+            ];
+            wpbPendingSave($txnId, $pending);
+            wpbClearState($chatId);
+            wpbDepositCompleted($chatId);
+            $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
+            tgSend(
+                $token,
+                $chatId,
+                "💳 <b>Card Payment Selected</b>\n\n"
+                . "<b>🎮 WePlay ID:</b> <code>" . htmlspecialchars($pending['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+                . "<b>💵 Amount:</b> <b>₹" . number_format($amount, 2) . "</b>\n"
+                . "<b>🧾 Transaction ID:</b> <code>{$txnId}</code>\n\n"
+                . "<b>Open the secure WePlay/payment gateway page below and enter your card details there.</b>\n"
+                . $cardNotice . "\n\n"
+                . "<b>After payment is completed, the admin will verify it and you will receive a success notification.</b>",
+                wpbPaymentKeyboard($cfg)
+            );
+            wpbNotifyAdmin($cfg, $txnId);
+            wpbLog("Card deposit request txn={$txnId} chat={$chatId} amount={$amount}", 'success');
+            return;
+        }
+
         $qrFile = WPB_QR_DIR . $txnId . '.png';
         $upi = wpbUpiString($cfg, $amount, $txnId);
+        if (!trim($cfg['upi_id'] ?? '')) {
+            tgSend($token, $chatId, "⚠️ <b>UPI setup is pending. Please contact the admin or choose Card payment.</b>");
+            return;
+        }
         if (!wpbQr($upi, $qrFile)) {
             tgSend($token, $chatId, "❌ <b>Unable to generate the QR code. Please contact the admin.</b>");
             wpbLog("QR failed for {$txnId}", 'error');
@@ -467,6 +522,7 @@ function wpbHandleText($cfg, $msg) {
             'user_name' => wpbUserName($msg),
             'weplay_id' => $data['weplay_id'] ?? '',
             'amount' => $amount,
+            'payment_method' => 'upi',
             'status' => 'pending_verification',
             'created_at' => date('c'),
         ];
@@ -523,6 +579,7 @@ function wpbNotifyAdmin($cfg, $txnId) {
         . "<b>Chat ID:</b> <code>" . htmlspecialchars((string)$p['chat_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . "<b>WePlay ID:</b> <code>" . htmlspecialchars($p['weplay_id'] ?? '', ENT_NOQUOTES, 'UTF-8') . "</code>\n"
         . "<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n"
+        . "<b>Payment Method:</b> <b>" . strtoupper(htmlspecialchars($p['payment_method'] ?? 'upi', ENT_NOQUOTES, 'UTF-8')) . "</b>\n"
         . "\n<b>Verify the payment from the WePlay/payment dashboard, then approve or reject.</b>\n"
         . "<b>Recharge link:</b> " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
     tgSend($token, $admin, $msg, wpbAdminButtons($txnId));
@@ -532,6 +589,29 @@ function wpbHandleCallback($cfg, $cb) {
     $token = trim($cfg['bot_token'] ?? '');
     $data = $cb['data'] ?? '';
     $cbId = $cb['id'] ?? '';
+
+    if (preg_match('/^paymethod:(upi|card)$/', $data, $m)) {
+        $chatId = $cb['message']['chat']['id'] ?? '';
+        $state = $chatId ? wpbGetState($chatId) : null;
+        if (!$chatId || !$state || ($state['state'] ?? '') !== 'await_method') {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Please start /Deposit again.', 'show_alert' => true], $token);
+            return;
+        }
+        $stateData = $state['data'] ?? [];
+        $stateData['payment_method'] = $m[1];
+        wpbSetState($chatId, 'await_amount', $stateData);
+        tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => strtoupper($m[1]) . ' selected'], $token);
+        tgSend(
+            $token,
+            $chatId,
+            "<b>" . strtoupper($m[1]) . " payment selected.</b>\n\n"
+            . "<b>Please send the deposit amount.</b>\n\n"
+            . "<b>Minimum:</b> ₹" . (int)$cfg['min_deposit'] . "\n"
+            . "<b>Maximum:</b> ₹" . (int)$cfg['max_deposit']
+        );
+        return;
+    }
+
     $admin = (string)($cfg['admin_chat_id'] ?? '');
     $fromId = (string)($cb['from']['id'] ?? '');
     if ($admin && $admin[0] !== '-' && $fromId !== $admin) {
