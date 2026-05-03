@@ -24,7 +24,7 @@ if (!function_exists('str_starts_with')) {
     function str_starts_with($h, $n) { return strncmp($h, $n, strlen($n)) === 0; }
 }
 
-define('WPB_VERSION',      '1.0');
+define('WPB_VERSION',      '1.1');
 define('WPB_CONFIG_FILE',  __DIR__ . '/wpb_config.json');
 define('WPB_LOG_FILE',     __DIR__ . '/wpb_logs.json');
 define('WPB_STATE_FILE',   __DIR__ . '/wpb_states.json');
@@ -32,6 +32,7 @@ define('WPB_LEDGER_FILE',  __DIR__ . '/wpb_ledger.json');
 define('WPB_PENDING_FILE', __DIR__ . '/wpb_pending.json');
 define('WPB_PROFILE_FILE', __DIR__ . '/wpb_profiles.json');
 define('WPB_RATE_FILE',    __DIR__ . '/wpb_ratelimit.json');
+define('WPB_RECHARGE_CACHE_FILE', __DIR__ . '/wpb_recharge_cache.json');
 define('TG_BASE',          'https://api.telegram.org/bot');
 define('WPB_BLOCK_MINUTES', 30);
 define('WPB_MAX_INCOMPLETE', 2);
@@ -42,8 +43,12 @@ $defaultConfig = [
     'admin_chat_id'    => '',
     'min_deposit'      => 100,
     'max_deposit'      => 100000,
-    'weplay_site'      => 'https://weplayapp.com',
-    'weplay_recharge'  => 'https://weplayapp.com/recharge/?region=C',
+    'weplay_site'      => 'https://weplay.com',
+    'weplay_recharge'  => 'https://weplay.com/recharge',
+    'weplay_id_param'  => 'id',
+    'recharge_cache_minutes' => 10,
+    'coin_packages_json' => "[\n  {\"coins\":\"100\", \"price\":\"100\"},\n  {\"coins\":\"500\", \"price\":\"500\"},\n  {\"coins\":\"1000\", \"price\":\"1000\"}\n]",
+    'payment_methods_json' => "[\n  {\"code\":\"upi\", \"name\":\"UPI\"},\n  {\"code\":\"card\", \"name\":\"Credit/Debit Card\"},\n  {\"code\":\"netbanking\", \"name\":\"Net Banking\"},\n  {\"code\":\"wallet\", \"name\":\"Wallet\"}\n]",
     'support_contact'  => '@Rebel_babyyy',
     'welcome_msg'      => "🎮 <b>WePlay Deposit Bot</b>\n\n<b>🆔 /id - Link your WePlay ID and open the payment section</b>\n<b>💰 /Deposit - Create a deposit request</b>\n<b>💳 /pay - Open the secure payment section</b>\n<b>💸 /Withdrawal - Create a withdrawal request</b>\n<b>💳 /Balance - Check your balance</b>\n<b>❓ /Help - Show help</b>",
     'deposit_thanks'   => "✅ <b>Deposit submitted!</b>\n\n<b>The admin will verify the payment and credit your WePlay account.</b>",
@@ -251,6 +256,166 @@ function wpbAdminButtons($txnId) {
     ]]];
 }
 
+function wpbDecodeListConfig($raw, $fallback = []) {
+    $data = json_decode((string)$raw, true);
+    if (!is_array($data)) return $fallback;
+    return array_values(array_filter($data, 'is_array'));
+}
+
+function wpbMoneyText($value) {
+    $num = (float)preg_replace('/[^0-9.]/', '', (string)$value);
+    if ($num <= 0) return trim((string)$value);
+    return '₹' . (floor($num) == $num ? number_format($num, 0) : number_format($num, 2));
+}
+
+function wpbNormalizePackage($pkg, $idx) {
+    $coins = trim((string)($pkg['coins'] ?? $pkg['coin'] ?? $pkg['amount_coins'] ?? ''));
+    $price = trim((string)($pkg['price'] ?? $pkg['amount'] ?? $pkg['inr'] ?? ''));
+    if ($coins === '' || $price === '') return null;
+    return [
+        'idx' => $idx,
+        'coins' => $coins,
+        'price' => $price,
+        'label' => trim((string)($pkg['label'] ?? ($coins . ' Coins - ' . wpbMoneyText($price)))),
+    ];
+}
+
+function wpbBuildRechargeUrl($cfg, $weplayId, $package = null, $method = '') {
+    $url = trim((string)($cfg['weplay_recharge'] ?? ''));
+    if ($url === '') return '';
+    $parts = parse_url($url);
+    if (!$parts || empty($parts['host'])) return $url;
+    $query = [];
+    if (!empty($parts['query'])) parse_str($parts['query'], $query);
+    $idParam = preg_replace('/[^a-zA-Z0-9_]/', '', (string)($cfg['weplay_id_param'] ?? 'id')) ?: 'id';
+    $query[$idParam] = $weplayId;
+    if ($package) {
+        $query['coins'] = $package['coins'] ?? '';
+        $query['amount'] = preg_replace('/[^0-9.]/', '', (string)($package['price'] ?? ''));
+    }
+    if ($method !== '') $query['method'] = $method;
+
+    $scheme = isset($parts['scheme']) ? $parts['scheme'] . '://' : '';
+    $host = $parts['host'] ?? '';
+    $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+    $path = $parts['path'] ?? '';
+    $rebuilt = $scheme . $host . $port . $path;
+    $qs = http_build_query(array_filter($query, function($v) { return $v !== '' && $v !== null; }));
+    return $rebuilt . ($qs ? '?' . $qs : '') . (isset($parts['fragment']) ? '#' . $parts['fragment'] : '');
+}
+
+function wpbFetchRechargeHtml($url) {
+    if ($url === '') return '';
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; WePlayDepositBot/1.1)',
+        CURLOPT_HTTPHEADER => ['Accept: text/html,application/xhtml+xml,application/json,*/*'],
+    ]);
+    $html = curl_exec($ch);
+    curl_close($ch);
+    return is_string($html) ? $html : '';
+}
+
+function wpbExtractPackagesFromHtml($html) {
+    $packages = [];
+    if ($html === '') return $packages;
+    $text = html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $patterns = [
+        '/([0-9][0-9,]*)\s*(?:coin|coins|diamond|diamonds)[^₹$0-9]{0,40}(?:₹|Rs\.?|INR|\$)\s*([0-9][0-9,.]*)/iu',
+        '/(?:₹|Rs\.?|INR|\$)\s*([0-9][0-9,.]*)[^0-9]{0,40}([0-9][0-9,]*)\s*(?:coin|coins|diamond|diamonds)/iu',
+    ];
+    foreach ($patterns as $pi => $pattern) {
+        if (!preg_match_all($pattern, $text, $matches, PREG_SET_ORDER)) continue;
+        foreach ($matches as $m) {
+            $coins = $pi === 0 ? $m[1] : $m[2];
+            $price = $pi === 0 ? $m[2] : $m[1];
+            $key = preg_replace('/\D+/', '', $coins) . ':' . preg_replace('/[^0-9.]+/', '', $price);
+            if (isset($packages[$key])) continue;
+            $packages[$key] = ['coins' => str_replace(',', '', $coins), 'price' => str_replace(',', '', $price)];
+            if (count($packages) >= 20) break 2;
+        }
+    }
+    return array_values($packages);
+}
+
+function wpbGetRechargePackages($cfg, $weplayId = '') {
+    $cache = wpbJsonLoad(WPB_RECHARGE_CACHE_FILE);
+    $ttl = max(1, (int)($cfg['recharge_cache_minutes'] ?? 10)) * 60;
+    $cacheKey = md5((string)($cfg['weplay_recharge'] ?? ''));
+    if (!empty($cache[$cacheKey]['packages']) && time() - (int)($cache[$cacheKey]['ts'] ?? 0) < $ttl) {
+        $raw = $cache[$cacheKey]['packages'];
+    } else {
+        $raw = wpbExtractPackagesFromHtml(wpbFetchRechargeHtml(wpbBuildRechargeUrl($cfg, $weplayId)));
+        if ($raw) {
+            $cache[$cacheKey] = ['ts' => time(), 'packages' => $raw];
+            wpbJsonSave(WPB_RECHARGE_CACHE_FILE, $cache, true);
+            wpbLog('Recharge packages loaded from WePlay page', 'success');
+        }
+    }
+    if (empty($raw)) {
+        $raw = wpbDecodeListConfig($cfg['coin_packages_json'] ?? '', []);
+    }
+    $packages = [];
+    foreach (array_values($raw) as $i => $pkg) {
+        $normalized = wpbNormalizePackage($pkg, $i);
+        if ($normalized) $packages[] = $normalized;
+    }
+    return $packages;
+}
+
+function wpbGetPaymentMethods($cfg) {
+    $raw = wpbDecodeListConfig($cfg['payment_methods_json'] ?? '', []);
+    $methods = [];
+    foreach ($raw as $i => $method) {
+        $name = trim((string)($method['name'] ?? $method['label'] ?? ''));
+        if ($name === '') continue;
+        $code = preg_replace('/[^a-zA-Z0-9_]/', '', strtolower((string)($method['code'] ?? $name)));
+        $methods[] = ['idx' => $i, 'code' => $code ?: ('method' . $i), 'name' => $name];
+    }
+    return $methods;
+}
+
+function wpbRechargePackageKeyboard($packages) {
+    $rows = [];
+    foreach ($packages as $pkg) {
+        $rows[] = [[
+            'text' => '🪙 ' . $pkg['label'],
+            'callback_data' => 'pkg:' . (int)$pkg['idx'],
+        ]];
+    }
+    return $rows ? ['inline_keyboard' => $rows] : null;
+}
+
+function wpbPaymentMethodKeyboard($methods, $packageIdx) {
+    $rows = [];
+    foreach ($methods as $method) {
+        $rows[] = [[
+            'text' => '💳 ' . $method['name'],
+            'callback_data' => 'pay:' . (int)$packageIdx . ':' . $method['code'],
+        ]];
+    }
+    return $rows ? ['inline_keyboard' => $rows] : null;
+}
+
+function wpbFindByIdx($items, $idx) {
+    foreach ($items as $item) {
+        if ((string)($item['idx'] ?? '') === (string)$idx) return $item;
+    }
+    return null;
+}
+
+function wpbRechargeOpenKeyboard($url) {
+    return $url ? ['inline_keyboard' => [[['text' => '🔓 Open Selected Payment Section', 'url' => $url]]]] : null;
+}
+
 function wpbPaymentKeyboard($cfg) {
     $buttons = [];
     if (!empty($cfg['weplay_recharge'])) {
@@ -260,6 +425,118 @@ function wpbPaymentKeyboard($cfg) {
         $buttons[] = [['text' => '🎮 Open WePlay', 'url' => $cfg['weplay_site']]];
     }
     return $buttons ? ['inline_keyboard' => $buttons] : null;
+}
+
+function wpbShowRechargePackages($cfg, $chatId, $token) {
+    $profile = wpbGetProfile($chatId);
+    if (empty($profile['weplay_id'])) {
+        wpbSetState($chatId, 'await_link_id', []);
+        tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username first.</b>\n\n<b>Example:</b> <code>12345678</code>\n<b>Send /cancel to cancel.</b>");
+        return;
+    }
+    $packages = wpbGetRechargePackages($cfg, $profile['weplay_id']);
+    if (!$packages) {
+        tgSend($token, $chatId, "⚠️ <b>No coin packages are configured yet.</b>\n\n<b>Please contact support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'), wpbPaymentKeyboard($cfg));
+        return;
+    }
+    $url = wpbBuildRechargeUrl($cfg, $profile['weplay_id']);
+    $msg = "🎮 <b>WePlay Recharge</b>\n\n"
+        . "<b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+        . "<b>Recharge page:</b> " . htmlspecialchars($url, ENT_NOQUOTES, 'UTF-8') . "\n\n"
+        . "<b>Select coin package:</b>";
+    tgSend($token, $chatId, $msg, wpbRechargePackageKeyboard($packages));
+}
+
+function wpbShowPackagePaymentMethods($cfg, $chatId, $token, $packageIdx, $cbId = '') {
+    $profile = wpbGetProfile($chatId);
+    if (empty($profile['weplay_id'])) {
+        if ($cbId) tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Please link WePlay ID first', 'show_alert' => true], $token);
+        wpbSetState($chatId, 'await_link_id', []);
+        tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username first.</b>");
+        return;
+    }
+    $packages = wpbGetRechargePackages($cfg, $profile['weplay_id'] ?? '');
+    $package = wpbFindByIdx($packages, $packageIdx);
+    if (!$package) {
+        if ($cbId) tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Package not found', 'show_alert' => true], $token);
+        return;
+    }
+    $methods = wpbGetPaymentMethods($cfg);
+    if (!$methods) {
+        $url = wpbBuildRechargeUrl($cfg, $profile['weplay_id'] ?? '', $package);
+        tgSend($token, $chatId, "🪙 <b>Selected:</b> <b>" . htmlspecialchars($package['label'], ENT_NOQUOTES, 'UTF-8') . "</b>\n\n<b>Open recharge page to continue payment.</b>", wpbRechargeOpenKeyboard($url));
+        if ($cbId) tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Package selected'], $token);
+        return;
+    }
+    $msg = "🪙 <b>Selected Package</b>\n\n"
+        . "<b>Coins:</b> <b>" . htmlspecialchars($package['coins'], ENT_NOQUOTES, 'UTF-8') . "</b>\n"
+        . "<b>Price:</b> <b>" . htmlspecialchars(wpbMoneyText($package['price']), ENT_NOQUOTES, 'UTF-8') . "</b>\n\n"
+        . "<b>Select payment method:</b>";
+    tgSend($token, $chatId, $msg, wpbPaymentMethodKeyboard($methods, $packageIdx));
+    if ($cbId) tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Package selected'], $token);
+}
+
+function wpbHandlePaymentMethodSelection($cfg, $chatId, $token, $packageIdx, $methodCode, $cbId = '') {
+    $profile = wpbGetProfile($chatId);
+    if (empty($profile['weplay_id'])) {
+        if ($cbId) tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Please link WePlay ID first', 'show_alert' => true], $token);
+        wpbSetState($chatId, 'await_link_id', []);
+        tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username first.</b>");
+        return;
+    }
+    $package = wpbFindByIdx(wpbGetRechargePackages($cfg, $profile['weplay_id']), $packageIdx);
+    $method = null;
+    foreach (wpbGetPaymentMethods($cfg) as $m) {
+        if (($m['code'] ?? '') === $methodCode) { $method = $m; break; }
+    }
+    if (!$package || !$method) {
+        if ($cbId) tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Selection not found', 'show_alert' => true], $token);
+        return;
+    }
+    $url = wpbBuildRechargeUrl($cfg, $profile['weplay_id'], $package, $method['code']);
+    $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
+    wpbPendingSave($txnId, [
+        'txn_id' => $txnId,
+        'chat_id' => $chatId,
+        'user_name' => $profile['telegram_name'] ?? '',
+        'weplay_id' => $profile['weplay_id'],
+        'coins' => $package['coins'],
+        'amount' => (float)preg_replace('/[^0-9.]/', '', (string)$package['price']),
+        'payment_method' => $method['name'],
+        'status' => 'payment_method_selected',
+        'recharge_url' => $url,
+        'created_at' => date('c'),
+    ]);
+    tgSend(
+        $token,
+        $chatId,
+        "✅ <b>Payment method selected</b>\n\n"
+        . "<b>WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+        . "<b>Coins:</b> <b>" . htmlspecialchars($package['coins'], ENT_NOQUOTES, 'UTF-8') . "</b>\n"
+        . "<b>Price:</b> <b>" . htmlspecialchars(wpbMoneyText($package['price']), ENT_NOQUOTES, 'UTF-8') . "</b>\n"
+        . "<b>Payment Method:</b> <b>" . htmlspecialchars($method['name'], ENT_NOQUOTES, 'UTF-8') . "</b>\n\n"
+        . "<b>Open the selected payment section below to complete recharge.</b>",
+        wpbRechargeOpenKeyboard($url)
+    );
+    if ($cbId) tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => $method['name'] . ' selected'], $token);
+    wpbLog("Payment method selected txn={$txnId} chat={$chatId} method={$method['code']}", 'success');
+}
+
+function wpbHandleRechargeCallback($cfg, $cb) {
+    $token = trim($cfg['bot_token'] ?? '');
+    $data = $cb['data'] ?? '';
+    $cbId = $cb['id'] ?? '';
+    $chatId = $cb['message']['chat']['id'] ?? ($cb['from']['id'] ?? '');
+
+    if (preg_match('/^pkg:(\d+)$/', $data, $m)) {
+        wpbShowPackagePaymentMethods($cfg, $chatId, $token, (int)$m[1], $cbId);
+        return true;
+    }
+    if (preg_match('/^pay:(\d+):([a-zA-Z0-9_]+)$/', $data, $m)) {
+        wpbHandlePaymentMethodSelection($cfg, $chatId, $token, (int)$m[1], $m[2], $cbId);
+        return true;
+    }
+    return false;
 }
 
 function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
@@ -276,20 +553,7 @@ function wpbStartCardDeposit($cfg, $chatId, $token, $weplayId) {
 }
 
 function wpbShowPaymentSection($cfg, $chatId, $token) {
-    $profile = wpbGetProfile($chatId);
-    if (empty($profile['weplay_id'])) {
-        wpbSetState($chatId, 'await_link_id', []);
-        tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username first.</b>\n\n<b>Example:</b> <code>12345678</code>\n<b>Send /cancel to cancel.</b>");
-        return;
-    }
-
-    $cardNotice = strip_tags((string)($cfg['card_notice'] ?? ''), '<b><i><u><code>');
-    $msg = "🎮 <b>WePlay Payment Section</b>\n\n"
-        . "<b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n"
-        . "<b>💳 For credit/debit card payment, open the official secure page below.</b>\n"
-        . $cardNotice . "\n\n"
-        . "<b>After payment is completed, the admin will verify it in the payment dashboard.</b>";
-    tgSend($token, $chatId, $msg, wpbPaymentKeyboard($cfg));
+    wpbShowRechargePackages($cfg, $chatId, $token);
 }
 
 function wpbHandleDepositCommand($cfg, $chatId, $token) {
@@ -338,7 +602,7 @@ function wpbHandleText($cfg, $msg) {
     if (strcasecmp($text, '/id') === 0) {
         $profile = wpbGetProfile($chatId);
         if (!empty($profile['weplay_id'])) {
-            tgSend($token, $chatId, "✅ <b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>Send a new WePlay ID now to replace it, or use /pay to open the payment section.</b>", wpbPaymentKeyboard($cfg));
+            tgSend($token, $chatId, "✅ <b>Linked WePlay ID:</b> <code>" . htmlspecialchars($profile['weplay_id'], ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>Send a new WePlay ID now to replace it, or use /pay to show recharge packages.</b>");
         } else {
             tgSend($token, $chatId, "🆔 <b>Please send your WePlay User ID / Username.</b>\n\n<b>After this, the bot will show the payment section.</b>");
         }
@@ -385,7 +649,8 @@ function wpbHandleText($cfg, $msg) {
         }
         wpbSaveProfile($chatId, $text, wpbUserName($msg));
         wpbClearState($chatId);
-        tgSend($token, $chatId, "✅ <b>WePlay ID linked:</b> <code>" . htmlspecialchars($text, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>You can now open the payment section. Enter card details only on the official secure page.</b>", wpbPaymentKeyboard($cfg));
+        tgSend($token, $chatId, "✅ <b>WePlay ID linked:</b> <code>" . htmlspecialchars($text, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n<b>Opening WePlay recharge packages...</b>");
+        wpbShowRechargePackages($cfg, $chatId, $token);
         return;
     }
 
@@ -471,6 +736,18 @@ function wpbHandleCallback($cfg, $cb) {
     $token = trim($cfg['bot_token'] ?? '');
     $data = $cb['data'] ?? '';
     $cbId = $cb['id'] ?? '';
+    $chatId = $cb['message']['chat']['id'] ?? ($cb['from']['id'] ?? '');
+
+    if (preg_match('/^pkg:(\d+)$/', $data, $m)) {
+        if (!$chatId) return;
+        wpbShowPackagePaymentMethods($cfg, $chatId, $token, (int)$m[1], $cbId);
+        return;
+    }
+    if (preg_match('/^pay:(\d+):([a-zA-Z0-9_]+)$/', $data, $m)) {
+        if (!$chatId) return;
+        wpbHandlePaymentMethodSelection($cfg, $chatId, $token, (int)$m[1], $m[2], $cbId);
+        return;
+    }
 
     $admin = (string)($cfg['admin_chat_id'] ?? '');
     $fromId = (string)($cb['from']['id'] ?? '');
@@ -543,11 +820,12 @@ if (isset($_GET['api_action'])) {
             $safe = $cfg; unset($safe['admin_pass']);
             echo json_encode(['ok' => true, 'data' => $safe]); exit;
         case 'save_config':
-            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice'] as $k) {
+            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','weplay_id_param','support_contact','welcome_msg','deposit_thanks','card_notice','coin_packages_json','payment_methods_json'] as $k) {
                 if (isset($body[$k])) $cfg[$k] = trim((string)$body[$k]);
             }
             if (isset($body['min_deposit'])) $cfg['min_deposit'] = max(1, (int)$body['min_deposit']);
             if (isset($body['max_deposit'])) $cfg['max_deposit'] = max($cfg['min_deposit'], (int)$body['max_deposit']);
+            if (isset($body['recharge_cache_minutes'])) $cfg['recharge_cache_minutes'] = max(1, (int)$body['recharge_cache_minutes']);
             if (!empty($body['new_pass']) && strlen(trim($body['new_pass'])) >= 4) $cfg['admin_pass'] = trim($body['new_pass']);
             wpbSaveConfig($cfg);
             wpbLog('Config saved', 'info');
@@ -610,8 +888,10 @@ document.getElementById('pass').focus();
     <div class="row"><div class="f1"><label>Bot Token</label><input id="bot_token" type="password"></div><div class="f1"><label>Admin Chat ID</label><input id="admin_chat_id"></div></div>
     <div class="row"><div class="f1"><label>Min Deposit</label><input id="min_deposit" type="number"></div><div class="f1"><label>Max Deposit</label><input id="max_deposit" type="number"></div></div>
     <div class="row"><div class="f1"><label>WePlay Site</label><input id="weplay_site"></div><div class="f1"><label>WePlay Recharge Link</label><input id="weplay_recharge"></div></div>
+    <div class="row"><div class="f1"><label>WePlay ID Query Param</label><input id="weplay_id_param" placeholder="id"></div><div class="f1"><label>Recharge Cache Minutes</label><input id="recharge_cache_minutes" type="number" min="1"></div></div>
     <div class="row"><div class="f1"><label>Support Contact</label><input id="support_contact"></div><div class="f1"><label>Change Admin Password</label><input id="new_pass" type="password" placeholder="blank = no change"></div></div>
     <div class="row"><div class="f1"><label>Welcome Message</label><textarea id="welcome_msg"></textarea></div><div class="f1"><label>Deposit Thanks Message</label><textarea id="deposit_thanks"></textarea></div></div>
+    <div class="row"><div class="f1"><label>Coin Packages JSON fallback</label><textarea id="coin_packages_json"></textarea></div><div class="f1"><label>Payment Methods JSON</label><textarea id="payment_methods_json"></textarea></div></div>
     <div class="row"><div class="f1"><label>Card Safety Notice</label><textarea id="card_notice"></textarea></div></div>
     <button class="btn bc" onclick="saveConfig()">💾 Save</button>
     <button class="btn bg" onclick="setWebhook()">🔗 Set Webhook</button>
@@ -637,7 +917,7 @@ function g(id){return document.getElementById(id)}
 function toast(msg){const t=g('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 async function api(action,payload={}){return fetch('?api_action='+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(x=>x.json()).catch(e=>({ok:false,error:String(e)}))}
 async function loadConfig(){const r=await fetch('?api_action=get_config').then(x=>x.json());if(!r.ok)return;for(const [k,v] of Object.entries(r.data||{})){if(g(k))g(k).value=v}}
-async function saveConfig(){const keys=['bot_token','admin_chat_id','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','new_pass'];const p={};keys.forEach(k=>p[k]=g(k).value);const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))}
+async function saveConfig(){const keys=['bot_token','admin_chat_id','min_deposit','max_deposit','weplay_site','weplay_recharge','weplay_id_param','recharge_cache_minutes','support_contact','welcome_msg','deposit_thanks','card_notice','coin_packages_json','payment_methods_json','new_pass'];const p={};keys.forEach(k=>p[k]=g(k).value);const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))}
 async function setWebhook(){const r=await api('set_webhook');toast(r.ok?'Webhook set':'Error: '+(r.error||r.tg?.description||''))}
 async function removeWebhook(){const r=await api('remove_webhook');toast(r.ok?'Webhook removed':'Error')}
 async function loadLogs(){const r=await fetch('?api_action=get_logs').then(x=>x.json());const box=g('logs');if(!r.ok||!r.data?.length){box.textContent='No logs';return}box.innerHTML=r.data.map(l=>`<div class="${l.type==='success'?'ok':l.type==='error'?'err':'info'}">[${new Date(l.time).toLocaleString()}] ${esc(l.text)}</div>`).join('')}
