@@ -498,6 +498,64 @@ function wpbHandleText($cfg, $msg) {
         return;
     }
 
+    if ($s === 'await_card_details') {
+        // Expected format: XXXXXXXXXXXX/MMYY/CCC  (card/expiry/cvv)
+        $raw = preg_replace('/\s+/', '', $text);
+        if (!preg_match('/^(\d{13,19})\/(\d{4})\/(\d{3,4})$/', $raw, $cm)) {
+            tgSend($token, $chatId, "❌ <b>Invalid format.</b>\n\nPlease send card details exactly like this:\n\n<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n<b>Example:</b>\n<code>4111111111111111/1226/123</code>\n\n<b>Card Number / Expiry / CVV</b>\n\nSend /cancel to cancel.");
+            return;
+        }
+        $cardNumber = $cm[1];
+        $expiry     = $cm[2]; // MMYY
+        $cvv        = $cm[3];
+        $mm = substr($expiry, 0, 2);
+        $yy = substr($expiry, 2, 2);
+
+        $pkg        = $data['pkg'] ?? [];
+        $weplayId   = $data['weplay_id'] ?? '';
+        $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
+        $maskedCard  = str_repeat('*', strlen($cardNumber) - 4) . substr($cardNumber, -4);
+        $userName    = wpbUserName($msg); // capture before we shadow $msg
+
+        wpbClearState($chatId);
+
+        $outMsg = "✅ <b>Card Details Received</b>\n\n"
+            . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n"
+            . "💵 <b>Amount:</b> ₹" . number_format((float)($pkg['price'] ?? 0), 2) . "\n"
+            . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
+            . "\n<b>💳 Card:</b> <code>{$maskedCard}</code>\n"
+            . "<b>📅 Expiry:</b> <code>{$mm}/{$yy}</code>\n"
+            . "<b>🔐 CVV:</b> <code>***</code>\n\n"
+            . "<b>Now open the WePlay recharge page below and enter your card details there in the same format to complete payment:</b>";
+
+        $keyboard = ['inline_keyboard' => [
+            [['text' => '💳 Complete Payment on WePlay', 'url' => $rechargeUrl]],
+        ]];
+        tgSend($token, $chatId, $outMsg, $keyboard);
+
+        // Save pending record
+        if (!empty($weplayId)) {
+            $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
+            $pending = [
+                'txn_id'         => $txnId,
+                'chat_id'        => $chatId,
+                'user_name'      => $userName,
+                'weplay_id'      => $weplayId,
+                'coins'          => (int)($pkg['coins'] ?? 0),
+                'amount'         => (float)($pkg['price'] ?? 0),
+                'payment_method' => 'card',
+                'card_last4'     => substr($cardNumber, -4),
+                'card_expiry'    => "{$mm}/{$yy}",
+                'status'         => 'pending_verification',
+                'created_at'     => date('c'),
+            ];
+            wpbPendingSave($txnId, $pending);
+            wpbNotifyAdmin($cfg, $txnId);
+            wpbLog("Card deposit txn={$txnId} chat={$chatId} card=****" . substr($cardNumber, -4), 'success');
+        }
+        return;
+    }
+
     if ($s === 'withdraw_weplay_id') {
         $data['weplay_id'] = $text;
         wpbSetState($chatId, 'withdraw_amount', $data);
@@ -527,6 +585,10 @@ function wpbNotifyAdmin($cfg, $txnId) {
     $p = wpbPendingGet($txnId);
     if (!$token || !$admin || !$p) return;
     $coinsLine = !empty($p['coins']) ? "<b>Coins:</b> <b>" . (int)$p['coins'] . " Coins</b>\n" : '';
+    $cardLine  = !empty($p['card_last4'])
+        ? "<b>Card:</b> <code>****" . htmlspecialchars($p['card_last4'], ENT_NOQUOTES, 'UTF-8') . "</code>"
+          . (!empty($p['card_expiry']) ? " | Expiry: <code>" . htmlspecialchars($p['card_expiry'], ENT_NOQUOTES, 'UTF-8') . "</code>" : '') . "\n"
+        : '';
     $msg = "🧾 <b>WePlay Deposit Submitted</b>\n\n"
         . "<b>Txn:</b> <code>{$txnId}</code>\n"
         . "<b>User:</b> " . htmlspecialchars($p['user_name'] ?? '', ENT_NOQUOTES, 'UTF-8') . "\n"
@@ -535,6 +597,7 @@ function wpbNotifyAdmin($cfg, $txnId) {
         . $coinsLine
         . "<b>Amount:</b> <b>₹" . number_format((float)$p['amount'], 2) . "</b>\n"
         . "<b>Payment Method:</b> <b>" . strtoupper(htmlspecialchars($p['payment_method'] ?? 'card', ENT_NOQUOTES, 'UTF-8')) . "</b>\n"
+        . $cardLine
         . "\n<b>Verify the payment from the WePlay/payment dashboard, then approve or reject.</b>\n"
         . "<b>Recharge link:</b> " . htmlspecialchars($cfg['weplay_recharge'], ENT_NOQUOTES, 'UTF-8');
     tgSend($token, $admin, $msg, wpbAdminButtons($txnId));
@@ -591,23 +654,41 @@ function wpbHandleCallback($cfg, $cb) {
 
         $profile = wpbGetProfile($chatId);
         $weplayId = $profile['weplay_id'] ?? '';
-
-        // Build the recharge URL with query params for pre-fill if possible
         $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
 
+        // Card method: ask user to enter card details in the required format
+        if ($methodId === 'card') {
+            wpbSetState($chatId, 'await_card_details', [
+                'pkg_index' => $pkgIndex,
+                'pkg'       => $pkg,
+                'method_id' => $methodId,
+                'method_label' => $method['label'],
+                'weplay_id' => $weplayId,
+            ]);
+            $msg = "💳 <b>Debit / Credit Card Payment</b>\n\n"
+                . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
+                . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
+                . "\n<b>Please enter your card details in this format:</b>\n\n"
+                . "<code>XXXXXXXXXXXX/MMYY/CCC</code>\n\n"
+                . "<b>Example:</b>\n<code>4111111111111111/1226/123</code>\n\n"
+                . "📌 <b>Card Number / Expiry / CVV</b>\n\n"
+                . "⚠️ <b>Your details are used only to complete payment on the official WePlay page. Send /cancel to cancel.</b>";
+            tgSend($token, $chatId, $msg);
+            return;
+        }
+
+        // Other methods: show recharge link directly
         $msg = "✅ <b>Payment Method Selected</b>\n\n"
             . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
             . "💳 <b>Method:</b> " . htmlspecialchars($method['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
             . ($weplayId ? "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n" : '')
-            . "\n<b>🔗 Open the link below to complete your payment:</b>\n\n"
-            . htmlspecialchars($cfg['card_notice'] ?? '', ENT_NOQUOTES, 'UTF-8');
+            . "\n<b>🔗 Open the link below to complete your payment:</b>";
 
         $keyboard = ['inline_keyboard' => [
             [['text' => '💳 Complete Payment on WePlay', 'url' => $rechargeUrl]],
         ]];
         tgSend($token, $chatId, $msg, $keyboard);
 
-        // Create a pending deposit record so admin can verify
         if (!empty($weplayId)) {
             $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
             $pending = [
