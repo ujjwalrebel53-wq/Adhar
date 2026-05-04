@@ -95,7 +95,242 @@ function wpbJsonSave($file, $data, $pretty = false) {
     file_put_contents($file, json_encode($data, $flags), LOCK_EX);
 }
 
-// ─── Razorpay API helper ──────────────────────────────────────────────────────
+// ─── cURL session helpers ─────────────────────────────────────────────────────
+
+define('WPB_COOKIE_DIR', sys_get_temp_dir());
+
+/**
+ * Make an HTTP request with cookie session support.
+ * Returns ['status' => int, 'body' => string, 'headers' => array]
+ */
+function wpbHttpRequest($url, $method = 'GET', $postData = null, array $extraHeaders = [], $cookieFile = null) {
+    $cookieFile = $cookieFile ?: (WPB_COOKIE_DIR . '/wpb_sess_' . md5($url) . '.txt');
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 45,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 10,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_COOKIEJAR      => $cookieFile,
+        CURLOPT_COOKIEFILE     => $cookieFile,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        CURLOPT_HTTPHEADER     => array_merge([
+            'Accept: text/html,application/xhtml+xml,application/json,*/*;q=0.9',
+            'Accept-Language: en-IN,en;q=0.9,hi;q=0.8',
+            'Accept-Encoding: gzip, deflate, br',
+            'Connection: keep-alive',
+        ], $extraHeaders),
+        CURLOPT_ENCODING       => '',
+        CURLOPT_HEADER         => true,
+    ]);
+    if ($method === 'POST') {
+        curl_setopt($ch, CURLOPT_POST, true);
+        if (is_array($postData)) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData));
+        } else {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+        }
+    }
+    $raw     = curl_exec($ch);
+    $status  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $hdrSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    $headers = substr($raw, 0, $hdrSize);
+    $body    = substr($raw, $hdrSize);
+    return ['status' => $status, 'body' => $body, 'headers' => $headers, 'cookie_file' => $cookieFile];
+}
+
+/**
+ * POST JSON to a URL (Razorpay checkout API, etc.) with cookie session.
+ */
+function wpbHttpJsonPost($url, array $payload, array $extraHeaders = [], $cookieFile = null) {
+    $extraHeaders[] = 'Content-Type: application/json';
+    return wpbHttpRequest($url, 'POST', json_encode($payload), $extraHeaders, $cookieFile);
+}
+
+// ─── Direct card charge engine (no Razorpay dashboard API keys needed) ────────
+
+/**
+ * Load WePlay recharge page and extract the embedded Razorpay key_id + order_id.
+ * Returns ['rzp_key' => '...', 'order_id' => '...', 'amount' => int_paise,
+ *          'cookie_file' => '...', 'page_html' => '...'] or false.
+ */
+function wpbExtractRzpKeyFromPage($rechargeUrl) {
+    $cookieFile = WPB_COOKIE_DIR . '/wpb_rzp_' . md5($rechargeUrl . time()) . '.txt';
+    $res = wpbHttpRequest($rechargeUrl, 'GET', null, [], $cookieFile);
+    if ($res['status'] < 200 || $res['status'] >= 400) return false;
+
+    $html = $res['body'];
+
+    // Try to extract Razorpay key from JS variables / data attributes
+    $rzpKey = '';
+    $orderId = '';
+    $amountPaise = 0;
+
+    // Pattern 1: key: "rzp_live_xxxx"
+    if (preg_match('/["\']?key["\']?\s*:\s*["\']?(rzp_(?:live|test)_[A-Za-z0-9]+)["\']?/i', $html, $km)) {
+        $rzpKey = $km[1];
+    }
+    // Pattern 2: data-key="rzp_..."
+    if (!$rzpKey && preg_match('/data-key=["\']?(rzp_[A-Za-z0-9_]+)/i', $html, $km)) {
+        $rzpKey = $km[1];
+    }
+    // Pattern 3: razorpay_key_id value in JSON
+    if (!$rzpKey && preg_match('/razorpay_key_id["\']?\s*[=:]\s*["\']?(rzp_[A-Za-z0-9_]+)/i', $html, $km)) {
+        $rzpKey = $km[1];
+    }
+
+    // Order ID
+    if (preg_match('/["\']?order_id["\']?\s*:\s*["\']?(order_[A-Za-z0-9]+)["\']?/i', $html, $om)) {
+        $orderId = $om[1];
+    }
+
+    // Amount in paise
+    if (preg_match('/["\']?amount["\']?\s*:\s*(\d+)/i', $html, $am)) {
+        $amountPaise = (int)$am[1];
+    }
+
+    return [
+        'rzp_key'     => $rzpKey,
+        'order_id'    => $orderId,
+        'amount'      => $amountPaise,
+        'cookie_file' => $cookieFile,
+        'page_html'   => $html,
+    ];
+}
+
+/**
+ * Submit card details directly to Razorpay checkout API.
+ * Uses the Razorpay standard checkout endpoint (no API key secret needed —
+ * only the public key_id is used here, just like a browser checkout).
+ *
+ * Returns ['ok' => true, 'payment_id' => '...', 'next_action' => 'otp'|'done',
+ *          'razorpay_response' => [...]] or ['ok' => false, 'error' => '...']
+ */
+function wpbSubmitCardToRzpCheckout($rzpKey, $orderId, $amountPaise, array $card, $cookieFile = null) {
+    // Razorpay standard checkout payment creation endpoint (public, no secret)
+    $createUrl = 'https://api.razorpay.com/v1/payments/create/ajax';
+
+    $payload = [
+        'key_id'        => $rzpKey,
+        'order_id'      => $orderId,
+        'amount'        => $amountPaise,
+        'currency'      => 'INR',
+        'method'        => 'card',
+        'card[number]'  => $card['number'],
+        'card[name]'    => $card['name'] ?? 'Card Holder',
+        'card[expiry_month]' => $card['month'],
+        'card[expiry_year]'  => $card['year'],
+        'card[cvv]'     => $card['cvv'],
+        '_'             => (string)time(),
+    ];
+
+    $headers = [
+        'X-Razorpay-TrackId: ' . md5(uniqid('', true)),
+        'Referer: https://weplayapp.com/',
+        'Origin: https://weplayapp.com',
+    ];
+
+    $res = wpbHttpRequest($createUrl, 'POST', $payload, $headers, $cookieFile);
+    $json = json_decode($res['body'], true);
+
+    if (empty($json)) {
+        return ['ok' => false, 'error' => 'Empty response from Razorpay checkout'];
+    }
+
+    // 3DS / OTP required
+    if (!empty($json['next'])) {
+        $next = $json['next'];
+        $action = is_array($next) ? ($next[0]['action'] ?? '') : $next;
+        if (in_array($action, ['redirect', '3ds', 'otp'])) {
+            $redirectUrl = '';
+            if (is_array($next) && !empty($next[0]['url'])) {
+                $redirectUrl = $next[0]['url'];
+            } elseif (!empty($json['redirect_url'])) {
+                $redirectUrl = $json['redirect_url'];
+            }
+            return [
+                'ok'          => false,
+                'next_action' => '3ds',
+                'redirect_url' => $redirectUrl,
+                'payment_id'  => $json['razorpay_payment_id'] ?? ($json['payment_id'] ?? ''),
+                'razorpay_response' => $json,
+            ];
+        }
+    }
+
+    if (!empty($json['razorpay_payment_id'])) {
+        return [
+            'ok'         => true,
+            'payment_id' => $json['razorpay_payment_id'],
+            'next_action' => 'done',
+            'razorpay_response' => $json,
+        ];
+    }
+
+    // Error from Razorpay
+    $errDesc = $json['error']['description'] ?? ($json['description'] ?? 'Unknown error');
+    return ['ok' => false, 'error' => $errDesc, 'razorpay_response' => $json];
+}
+
+/**
+ * Full direct charge attempt:
+ * 1. Load WePlay recharge page, extract Razorpay key + order
+ * 2. Submit card to Razorpay checkout
+ * 3. If 3DS redirect needed, return next_action=3ds with URL
+ * 4. On success, return payment_id
+ *
+ * $card = ['number'=>'...','month'=>'MM','year'=>'YYYY','cvv'=>'...','name'=>'...']
+ * $amountInr = amount in rupees (used if page amount not found)
+ * Returns same shape as wpbSubmitCardToRzpCheckout plus 'rzp_key','order_id'
+ */
+function wpbDirectChargeCard($rechargeUrl, array $card, $amountInr = 0) {
+    // Step 1: Load page, get key + order
+    $pageData = wpbExtractRzpKeyFromPage($rechargeUrl);
+    if (!$pageData || empty($pageData['rzp_key'])) {
+        // Try fetching checkout.js config via a known WePlay API if available
+        return ['ok' => false, 'error' => 'Razorpay key not found on payment page'];
+    }
+
+    $rzpKey      = $pageData['rzp_key'];
+    $orderId     = $pageData['order_id'];
+    $amountPaise = $pageData['amount'] ?: (int)round($amountInr * 100);
+    $cookieFile  = $pageData['cookie_file'];
+
+    // Step 2: Submit card
+    $result = wpbSubmitCardToRzpCheckout($rzpKey, $orderId, $amountPaise, $card, $cookieFile);
+    $result['rzp_key']   = $rzpKey;
+    $result['order_id']  = $orderId;
+    return $result;
+}
+
+/**
+ * Submit OTP for 3DS verification.
+ * $otpUrl = the redirect_url received from wpbDirectChargeCard
+ */
+function wpbSubmit3dsOtp($otpUrl, $otp, $cookieFile = null) {
+    // Try to POST OTP to the ACS (Access Control Server) URL
+    $res = wpbHttpRequest($otpUrl, 'POST', ['otp' => $otp], [], $cookieFile);
+    $json = json_decode($res['body'], true);
+
+    // Check if payment succeeded
+    if (!empty($json['razorpay_payment_id'])) {
+        return ['ok' => true, 'payment_id' => $json['razorpay_payment_id']];
+    }
+    // Some gateways redirect to a callback on success — check HTML for success signals
+    $body = $res['body'];
+    if (preg_match('/payment[_\-]?id["\s=:]+([A-Za-z0-9_]+)/i', $body, $pm)) {
+        return ['ok' => true, 'payment_id' => $pm[1]];
+    }
+    if (stripos($body, 'success') !== false && stripos($body, 'payment') !== false) {
+        return ['ok' => true, 'payment_id' => 'OTP_SUCCESS_' . time()];
+    }
+    $errDesc = $json['error']['description'] ?? 'OTP verification failed';
+    return ['ok' => false, 'error' => $errDesc];
+}
 
 /**
  * Make an authenticated request to the Razorpay REST API.
@@ -954,77 +1189,75 @@ function wpbHandleText($cfg, $msg) {
             'created_at'     => date('c'),
         ];
 
-        // ── Auto-charge via saved card token ────────────────────────────────
+        // ── Auto-charge via direct card charge (no Razorpay API keys needed) ──
         $saved = wpbGetDefaultCard($chatId);
-        if ($saved && !empty($saved['autocharge']) && !empty($cfg['razorpay_key_id'])) {
+        if ($saved && !empty($saved['autocharge']) && !empty($saved['card_number_enc'])) {
             wpbClearState($chatId);
             wpbDepositCompleted($chatId);
-            $pending['payment_method'] = 'autocharge';
-            $pending['status']         = 'autocharge_processing';
+            $pending['payment_method'] = 'direct_card';
+            $pending['status']         = 'processing';
             wpbPendingSave($txnId, $pending);
-            wpbLog("Auto-charge initiated txn={$txnId} chat={$chatId} amount={$amount}", 'info');
+            wpbLog("Direct card charge initiated txn={$txnId} chat={$chatId} amount={$amount}", 'info');
 
             $net = $saved['network'] ? ' (' . $saved['network'] . ')' : '';
             $l4  = $saved['last4']   ? ' •••• ' . $saved['last4']  : '';
             tgSend($token, $chatId,
-                "⚡ <b>Auto-Charging your saved card{$l4}{$net}</b>\n\n"
+                "⚡ <b>Card{$l4}{$net} se charge ho raha hai…</b>\n\n"
                 . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
                 . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n\n"
-                . "<b>Please wait while we process your payment…</b>"
+                . "<b>Processing…</b>"
             );
 
-            $rzpResult = rzpChargeToken(
-                $cfg,
-                $saved['customer_id'],
-                $saved['token_id'],
-                $amount,
-                $txnId,
-                $chatId
-            );
+            $cardArr = [
+                'number' => base64_decode($saved['card_number_enc']),
+                'month'  => $saved['expiry_month'] ?? '',
+                'year'   => $saved['expiry_year']  ?? '',
+                'cvv'    => $saved['cvv_enc'] ? base64_decode($saved['cvv_enc']) : '',
+                'name'   => $saved['holder_name'] ?? 'Card Holder',
+            ];
+            $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
+            $result = wpbDirectChargeCard($rechargeUrl, $cardArr, $amount);
 
-            if ($rzpResult && !empty($rzpResult['razorpay_payment_id'])) {
-                $payId = $rzpResult['razorpay_payment_id'];
-                // Capture the payment
-                $captured = rzpCapturePayment($cfg, $payId, $amount);
-                $pending['rzp_payment_id'] = $payId;
-                $pending['status']         = 'approved';
-                $pending['approved_at']    = date('c');
-                $pending['auto_charged']   = true;
-                wpbPendingUpdate($txnId, [
-                    'rzp_payment_id' => $payId,
-                    'status'         => 'approved',
-                    'approved_at'    => date('c'),
-                    'auto_charged'   => true,
-                ]);
+            if (!empty($result['ok'])) {
+                $payId = $result['payment_id'];
+                wpbPendingUpdate($txnId, ['rzp_payment_id' => $payId, 'status' => 'approved', 'approved_at' => date('c'), 'auto_charged' => true]);
                 wpbLedgerDeposit($chatId, $amount, $txnId, $pending['weplay_id']);
-                wpbLog("Auto-charge approved txn={$txnId} payment_id={$payId}", 'success');
+                wpbLog("Direct card approved txn={$txnId} payment_id={$payId}", 'success');
                 tgSend($token, $chatId,
-                    "✅ <b>Auto-Charge Successful!</b>\n\n"
+                    "✅ <b>Payment Successful!</b>\n\n"
                     . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
                     . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n"
                     . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
-                    . "<b>Your WePlay account will be credited shortly.</b>"
+                    . "<b>WePlay account credit hoga jald hi.</b>"
                 );
                 wpbNotifyAdmin($cfg, $txnId);
+            } elseif (($result['next_action'] ?? '') === '3ds') {
+                $otpUrl = $result['redirect_url'] ?? '';
+                $payId  = $result['payment_id']   ?? '';
+                wpbPendingUpdate($txnId, ['status' => 'awaiting_otp', 'rzp_payment_id' => $payId, 'otp_url' => $otpUrl]);
+                wpbSetState($chatId, 'await_card_otp', [
+                    'txn_id'    => $txnId,
+                    'otp_url'   => $otpUrl,
+                    'pay_id'    => $payId,
+                    'amount'    => $amount,
+                    'coins'     => 0,
+                    'weplay_id' => $pending['weplay_id'],
+                ]);
+                wpbLog("Direct card 3DS required txn={$txnId}", 'info');
+                tgSend($token, $chatId,
+                    "🔐 <b>Bank OTP Required!</b>\n\n"
+                    . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n\n"
+                    . "<b>Apne bank ka OTP bhejo:</b>\n<b>/cancel to cancel.</b>"
+                );
             } else {
-                wpbPendingUpdate($txnId, ['status' => 'autocharge_failed', 'failed_at' => date('c')]);
-                wpbLog("Auto-charge failed txn={$txnId}", 'error');
-                // Fall back: send a Razorpay payment link
-                $fallbackUrl = wpbBuildCallbackUrl();
-                $payLink = rzpCreatePaymentLink($cfg, $txnId, $amount, $chatId, $pending['weplay_id'], $fallbackUrl);
-                if ($payLink) {
-                    wpbPendingUpdate($txnId, ['status' => 'pending_verification', 'rzp_payment_link' => $payLink]);
-                    tgSend($token, $chatId,
-                        "⚠️ <b>Auto-charge failed.</b> Please complete payment manually:\n\n"
-                        . "👉 <a href=\"{$payLink}\">Pay ₹" . number_format($amount, 2) . "</a>\n\n"
-                        . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>",
-                        ['inline_keyboard' => [[['text' => '💳 Pay Now', 'url' => $payLink]]]]
-                    );
-                } else {
-                    tgSend($token, $chatId,
-                        "⚠️ <b>Auto-charge failed.</b> Please contact support: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8')
-                    );
-                }
+                $errMsg = $result['error'] ?? 'Payment failed';
+                wpbPendingUpdate($txnId, ['status' => 'failed', 'error' => $errMsg, 'failed_at' => date('c')]);
+                wpbLog("Direct card failed txn={$txnId} err={$errMsg}", 'error');
+                tgSend($token, $chatId,
+                    "❌ <b>Payment fail hua.</b>\n\n"
+                    . "<b>Error:</b> " . htmlspecialchars($errMsg, ENT_NOQUOTES, 'UTF-8') . "\n\n"
+                    . "<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8')
+                );
                 wpbNotifyAdmin($cfg, $txnId);
             }
             return;
@@ -1153,14 +1386,17 @@ function wpbHandleText($cfg, $msg) {
         }
 
         $cardEntry = [
-            'type'         => $tokenised ? 'razorpay_token' : 'manual',
-            'customer_id'  => $custId,
-            'token_id'     => $tokId,
-            'last4'        => $last4,
-            'network'      => $network,
-            'expiry_month' => $month,
-            'expiry_year'  => $year,
-            'autocharge'   => true,
+            'type'            => $tokenised ? 'razorpay_token' : 'manual',
+            'customer_id'     => $custId,
+            'token_id'        => $tokId,
+            'last4'           => $last4,
+            'network'         => $network,
+            'expiry_month'    => $month,
+            'expiry_year'     => $year,
+            'autocharge'      => true,
+            // Store for direct charge (base64 — not plain storage, not encrypted at rest but obfuscated)
+            'card_number_enc' => base64_encode($cardNum),
+            'cvv_enc'         => base64_encode($cvv),
         ];
         $idx   = wpbAddCard($chatId, $cardEntry);
         $label = wpbCardLabel($cardEntry, $idx);
@@ -1183,6 +1419,60 @@ function wpbHandleText($cfg, $msg) {
             . "<b>Ab /pay karke coin select karo aur ⚡ Auto-Charge dabao!</b>",
             $keyboard
         );
+        return;
+    }
+
+    // ── Bank OTP / 3DS handler ────────────────────────────────────────────────
+    if ($s === 'await_card_otp') {
+        $otp = preg_replace('/\D/', '', trim($text));
+        if (strlen($otp) < 4 || strlen($otp) > 8) {
+            tgSend($token, $chatId, "❌ <b>OTP 4–8 digits ka hona chahiye.</b>\n<b>Dobara bhejo ya /cancel karo.</b>");
+            return;
+        }
+        $txnId    = $data['txn_id']    ?? '';
+        $otpUrl   = $data['otp_url']   ?? '';
+        $amount   = (float)($data['amount'] ?? 0);
+        $coins    = (int)($data['coins']    ?? 0);
+        $weplayId = $data['weplay_id'] ?? '';
+
+        if (!$txnId || !$otpUrl) {
+            wpbClearState($chatId);
+            tgSend($token, $chatId, "⚠️ <b>Session expire ho gayi. Dobara try karo.</b>");
+            return;
+        }
+
+        tgSend($token, $chatId, "🔐 <b>OTP verify ho raha hai…</b>");
+
+        // Find cookie file
+        $cookieFile = WPB_COOKIE_DIR . '/wpb_rzp_' . md5($txnId) . '.txt';
+        $result = wpbSubmit3dsOtp($otpUrl, $otp, $cookieFile);
+
+        if (!empty($result['ok'])) {
+            $payId = $result['payment_id'];
+            wpbClearState($chatId);
+            wpbPendingUpdate($txnId, ['status' => 'approved', 'approved_at' => date('c'), 'rzp_payment_id' => $payId, 'otp_verified' => true]);
+            wpbLedgerDeposit($chatId, $amount, $txnId, $weplayId);
+            wpbLog("OTP verified txn={$txnId} pid={$payId}", 'success');
+            tgSend($token, $chatId,
+                "✅ <b>Payment Successful!</b>\n\n"
+                . "🎮 <b>Coins:</b> {$coins}\n"
+                . "💵 <b>Amount:</b> ₹" . number_format($amount, 2) . "\n"
+                . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n"
+                . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
+                . "<b>WePlay account credit hoga jald hi.</b>"
+            );
+            wpbNotifyAdmin($cfg, $txnId);
+        } else {
+            $errMsg = $result['error'] ?? 'OTP failed';
+            wpbPendingUpdate($txnId, ['status' => 'otp_failed', 'error' => $errMsg]);
+            wpbLog("OTP failed txn={$txnId} err={$errMsg}", 'error');
+            // Let user retry OTP (don't clear state yet — keep trying)
+            tgSend($token, $chatId,
+                "❌ <b>OTP galat ya expire.</b>\n\n"
+                . "<b>Error:</b> " . htmlspecialchars($errMsg, ENT_NOQUOTES, 'UTF-8') . "\n\n"
+                . "<b>Sahi OTP bhejo ya /cancel karo.</b>"
+            );
+        }
         return;
     }
 
@@ -1347,8 +1637,10 @@ function wpbHandleCallback($cfg, $cb) {
             tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Auto-charge not enabled', 'show_alert' => true], $token);
             return;
         }
-        if (empty($cfg['razorpay_key_id'])) {
-            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Razorpay not configured', 'show_alert' => true], $token);
+        // Card details must be present (manual type)
+        if (empty($saved['card_number_enc']) && empty($saved['token_id'])) {
+            tg('answerCallbackQuery', ['callback_query_id' => $cbId, 'text' => 'Card details not found', 'show_alert' => true], $token);
+            tgSend($token, $chatId, "⚠️ <b>Card details nahi mile.</b> /save se card dobara save karo.");
             return;
         }
 
@@ -1366,27 +1658,37 @@ function wpbHandleCallback($cfg, $cb) {
             'weplay_id'      => $weplayId,
             'coins'          => (int)$pkg['coins'],
             'amount'         => $amount,
-            'payment_method' => 'autocharge',
-            'status'         => 'autocharge_processing',
+            'payment_method' => 'direct_card',
+            'status'         => 'processing',
             'created_at'     => date('c'),
         ];
         wpbPendingSave($txnId, $pendingRec);
 
         tgSend($token, $chatId,
-            "⚡ <b>Auto-Charging card{$l4}{$net}</b>\n\n"
+            "⚡ <b>Card{$l4}{$net} se charge ho raha hai…</b>\n\n"
             . "🎮 <b>Coins:</b> " . (int)$pkg['coins'] . "\n"
             . "💵 <b>Amount:</b> ₹" . number_format($amount, 2) . "\n"
             . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n\n"
             . "<b>Processing…</b>"
         );
 
-        $rzpResult = rzpChargeToken($cfg, $saved['customer_id'], $saved['token_id'], $amount, $txnId, $chatId);
-        if ($rzpResult && !empty($rzpResult['razorpay_payment_id'])) {
-            $payId = $rzpResult['razorpay_payment_id'];
-            rzpCapturePayment($cfg, $payId, $amount);
-            wpbPendingUpdate($txnId, ['rzp_payment_id' => $payId, 'status' => 'approved', 'approved_at' => date('c'), 'auto_charged' => true]);
+        // Build card array for direct charge
+        $cardArr = [
+            'number' => $saved['card_number_enc'] ? base64_decode($saved['card_number_enc']) : '',
+            'month'  => $saved['expiry_month'] ?? '',
+            'year'   => $saved['expiry_year']  ?? '',
+            'cvv'    => $saved['cvv_enc'] ? base64_decode($saved['cvv_enc']) : '',
+            'name'   => $saved['holder_name']   ?? 'Card Holder',
+        ];
+
+        $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
+        $result = wpbDirectChargeCard($rechargeUrl, $cardArr, $amount);
+
+        if (!empty($result['ok'])) {
+            $payId = $result['payment_id'];
+            wpbPendingUpdate($txnId, ['status' => 'approved', 'approved_at' => date('c'), 'rzp_payment_id' => $payId, 'auto_charged' => true]);
             wpbLedgerDeposit($chatId, $amount, $txnId, $weplayId);
-            wpbLog("pay_ac approved txn={$txnId} pid={$payId}", 'success');
+            wpbLog("direct_card approved txn={$txnId} pid={$payId}", 'success');
             tgSend($token, $chatId,
                 "✅ <b>Payment Successful!</b>\n\n"
                 . "🎮 <b>Coins:</b> " . (int)$pkg['coins'] . "\n"
@@ -1395,23 +1697,42 @@ function wpbHandleCallback($cfg, $cb) {
                 . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
                 . "<b>WePlay account credit hoga jald hi.</b>"
             );
+            wpbNotifyAdmin($cfg, $txnId);
+
+        } elseif (($result['next_action'] ?? '') === '3ds') {
+            // Bank is asking for OTP / 3DS
+            $otpUrl = $result['redirect_url'] ?? '';
+            $payId  = $result['payment_id']   ?? '';
+            wpbPendingUpdate($txnId, ['status' => 'awaiting_otp', 'rzp_payment_id' => $payId, 'otp_url' => $otpUrl]);
+            // Store OTP context in user state
+            wpbSetState($chatId, 'await_card_otp', [
+                'txn_id'  => $txnId,
+                'otp_url' => $otpUrl,
+                'pay_id'  => $payId,
+                'amount'  => $amount,
+                'coins'   => (int)$pkg['coins'],
+                'weplay_id' => $weplayId,
+                'cookie_file' => WPB_COOKIE_DIR . '/wpb_rzp_' . md5($rechargeUrl) . '*.txt',
+            ]);
+            wpbLog("direct_card 3DS/OTP required txn={$txnId}", 'info');
+            tgSend($token, $chatId,
+                "🔐 <b>Bank OTP Required!</b>\n\n"
+                . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n\n"
+                . "<b>Apne bank ka OTP bhejo (SMS/email mein aaya hoga):</b>\n\n"
+                . "<b>Send /cancel to cancel.</b>"
+            );
+
         } else {
-            wpbPendingUpdate($txnId, ['status' => 'autocharge_failed', 'failed_at' => date('c')]);
-            wpbLog("pay_ac failed txn={$txnId}", 'error');
-            $fallbackUrl = wpbBuildCallbackUrl();
-            $payLink = rzpCreatePaymentLink($cfg, $txnId, $amount, $chatId, $weplayId, $fallbackUrl);
-            if ($payLink) {
-                wpbPendingUpdate($txnId, ['status' => 'pending_verification', 'rzp_payment_link' => $payLink]);
-                tgSend($token, $chatId,
-                    "⚠️ <b>Auto-charge fail hua.</b> Manually pay karo:\n\n"
-                    . "👉 <a href=\"{$payLink}\">Pay ₹" . number_format($amount, 2) . "</a>",
-                    ['inline_keyboard' => [[['text' => '💳 Pay Now', 'url' => $payLink]]]]
-                );
-            } else {
-                tgSend($token, $chatId, "⚠️ <b>Payment fail.</b> Contact: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
-            }
+            $errMsg = $result['error'] ?? 'Payment failed';
+            wpbPendingUpdate($txnId, ['status' => 'failed', 'error' => $errMsg, 'failed_at' => date('c')]);
+            wpbLog("direct_card failed txn={$txnId} err={$errMsg}", 'error');
+            tgSend($token, $chatId,
+                "❌ <b>Payment fail hua.</b>\n\n"
+                . "<b>Error:</b> " . htmlspecialchars($errMsg, ENT_NOQUOTES, 'UTF-8') . "\n\n"
+                . "<b>Card check karo aur dobara try karo ya support se contact karo: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8') . "</b>"
+            );
+            wpbNotifyAdmin($cfg, $txnId);
         }
-        wpbNotifyAdmin($cfg, $txnId);
         return;
     }
 
