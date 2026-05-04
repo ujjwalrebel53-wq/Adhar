@@ -56,6 +56,9 @@ $defaultConfig = [
     'razorpay_webhook_secret' => '',
     // Auto-charge: when enabled for a user, bot will charge their saved card automatically
     'autocharge_enabled'   => true,
+    // Manual payment fallback when no gateway is configured
+    'upi_id'               => '',
+    'payment_instructions' => '',
     // Each package: label shown on button, coins, price (INR)
     'coin_packages'        => [
         ['label' => '60 Coins — ₹80',    'coins' => 60,   'price' => 80],
@@ -291,8 +294,7 @@ function wpbDirectChargeCard($rechargeUrl, array $card, $amountInr = 0) {
     // Step 1: Load page, get key + order
     $pageData = wpbExtractRzpKeyFromPage($rechargeUrl);
     if (!$pageData || empty($pageData['rzp_key'])) {
-        // Try fetching checkout.js config via a known WePlay API if available
-        return ['ok' => false, 'error' => 'Razorpay key not found on payment page'];
+        return ['ok' => false, 'error' => 'no_gateway', 'error_detail' => 'Razorpay key not found on payment page'];
     }
 
     $rzpKey      = $pageData['rzp_key'];
@@ -900,6 +902,40 @@ function wpbShowCoinPackagesForPay($cfg, $chatId, $token, $weplayId) {
     );
 }
 
+/**
+ * Send payment fallback message (UPI / manual instructions) when no gateway is configured.
+ * Admin gets a notification to manually fulfill the order.
+ */
+function wpbSendPaymentFallback($cfg, $token, $chatId, $txnId, $amount, $coins, $weplayId) {
+    $upiId   = trim($cfg['upi_id'] ?? '');
+    $custom  = trim($cfg['payment_instructions'] ?? '');
+    $rechargeUrl = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
+
+    $coinsLine = $coins ? "\n<b>Coins:</b> {$coins}" : '';
+    $msg = "💳 <b>Complete Your Payment</b>\n\n"
+        . "<b>Amount:</b> ₹" . number_format($amount, 2) . $coinsLine . "\n"
+        . "<b>WePlay ID:</b> <code>" . htmlspecialchars($weplayId, ENT_NOQUOTES, 'UTF-8') . "</code>\n"
+        . "<b>Txn ID:</b> <code>{$txnId}</code>\n\n";
+
+    $keyboard = [];
+
+    if ($upiId) {
+        $upiLink = 'upi://pay?pa=' . urlencode($upiId) . '&pn=WePlay&am=' . $amount . '&tn=' . urlencode('WePlay ' . $txnId);
+        $msg .= "💳 <b>Pay via UPI:</b>\n<code>" . htmlspecialchars($upiId, ENT_NOQUOTES, 'UTF-8') . "</code>\n\n";
+        $keyboard[] = [['text' => '💳 Pay via UPI', 'url' => $upiLink]];
+    }
+
+    $keyboard[] = [['text' => '🌐 Open WePlay Recharge', 'url' => $rechargeUrl]];
+
+    if ($custom) {
+        $msg .= htmlspecialchars($custom, ENT_NOQUOTES, 'UTF-8') . "\n\n";
+    }
+
+    $msg .= "<b>After payment, your WePlay account will be credited.</b>";
+
+    tgSend($token, $chatId, $msg, $keyboard ? ['inline_keyboard' => $keyboard] : null);
+}
+
 function wpbBuildCallbackUrl() {
     $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https://' : 'http://';
     $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
@@ -1234,8 +1270,13 @@ function wpbHandleText($cfg, $msg) {
                     . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
                     . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n"
                     . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
-                    . "<b>WePlay account credit hoga jald hi.</b>"
+                    . "<b>Your WePlay account will be credited shortly.</b>"
                 );
+                wpbNotifyAdmin($cfg, $txnId);
+            } elseif (($result['error'] ?? '') === 'no_gateway') {
+                wpbPendingUpdate($txnId, ['status' => 'pending_manual', 'updated_at' => date('c')]);
+                wpbLog("No gateway — manual payment txn={$txnId}", 'info');
+                wpbSendPaymentFallback($cfg, $token, $chatId, $txnId, $amount, 0, $pending['weplay_id']);
                 wpbNotifyAdmin($cfg, $txnId);
             } elseif (($result['next_action'] ?? '') === '3ds') {
                 $otpUrl = $result['redirect_url'] ?? '';
@@ -1699,8 +1740,14 @@ function wpbHandleCallback($cfg, $cb) {
                 . "💵 <b>Amount:</b> ₹" . number_format($amount, 2) . "\n"
                 . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n"
                 . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
-                . "<b>WePlay account credit hoga jald hi.</b>"
+                . "<b>Your WePlay account will be credited shortly.</b>"
             );
+            wpbNotifyAdmin($cfg, $txnId);
+
+        } elseif (($result['error'] ?? '') === 'no_gateway') {
+            wpbPendingUpdate($txnId, ['status' => 'pending_manual', 'updated_at' => date('c')]);
+            wpbLog("No gateway — manual payment txn={$txnId}", 'info');
+            wpbSendPaymentFallback($cfg, $token, $chatId, $txnId, $amount, (int)$pkg['coins'], $weplayId);
             wpbNotifyAdmin($cfg, $txnId);
 
         } elseif (($result['next_action'] ?? '') === '3ds') {
@@ -1855,8 +1902,13 @@ function wpbHandleCallback($cfg, $cb) {
                     . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
                     . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n"
                     . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
-                    . "<b>WePlay account credit hoga jald hi.</b>"
+                    . "<b>Your WePlay account will be credited shortly.</b>"
                 );
+                wpbNotifyAdmin($cfg, $txnId);
+            } elseif (($result['error'] ?? '') === 'no_gateway') {
+                wpbPendingUpdate($txnId, ['status' => 'pending_manual', 'updated_at' => date('c')]);
+                wpbLog("No gateway — manual payment txn={$txnId}", 'info');
+                wpbSendPaymentFallback($cfg, $token, $chatId, $txnId, $amount, (int)$pkg['coins'], $weplayId);
                 wpbNotifyAdmin($cfg, $txnId);
             } elseif (($result['next_action'] ?? '') === '3ds') {
                 $otpUrl = $result['redirect_url'] ?? '';
@@ -2092,7 +2144,7 @@ if (isset($_GET['api_action'])) {
             $safe = $cfg; unset($safe['admin_pass']);
             echo json_encode(['ok' => true, 'data' => $safe]); exit;
         case 'save_config':
-            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','razorpay_key_id','razorpay_key_secret','razorpay_webhook_secret'] as $k) {
+            foreach (['bot_token','admin_chat_id','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','razorpay_key_id','razorpay_key_secret','razorpay_webhook_secret','upi_id','payment_instructions'] as $k) {
                 if (isset($body[$k])) $cfg[$k] = trim((string)$body[$k]);
             }
             if (isset($body['autocharge_enabled'])) $cfg['autocharge_enabled'] = (bool)$body['autocharge_enabled'];
@@ -2225,6 +2277,7 @@ document.getElementById('pass').focus();
     <div class="row"><div class="f1"><label>Support Contact</label><input id="support_contact"></div><div class="f1"><label>Change Admin Password</label><input id="new_pass" type="password" placeholder="blank = no change"></div></div>
     <div class="row"><div class="f1"><label>Welcome Message</label><textarea id="welcome_msg"></textarea></div><div class="f1"><label>Deposit Thanks Message</label><textarea id="deposit_thanks"></textarea></div></div>
     <div class="row"><div class="f1"><label>Card Safety Notice</label><textarea id="card_notice"></textarea></div></div>
+    <div class="row"><div class="f1"><label>UPI ID (fallback payment)</label><input id="upi_id" placeholder="yourname@upi"></div><div class="f1"><label>Manual Payment Instructions (shown when gateway unavailable)</label><textarea id="payment_instructions" placeholder="Optional extra instructions for users"></textarea></div></div>
     <button class="btn bc" onclick="saveConfig()">💾 Save</button>
     <button class="btn bg" onclick="setWebhook()">🔗 Set Webhook</button>
     <button class="btn br" onclick="removeWebhook()">Remove Webhook</button>
@@ -2350,7 +2403,7 @@ async function savePayMethods(){
 }
 
 async function saveConfig(){
-  const keys=['bot_token','admin_chat_id','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','new_pass'];
+  const keys=['bot_token','admin_chat_id','min_deposit','max_deposit','weplay_site','weplay_recharge','support_contact','welcome_msg','deposit_thanks','card_notice','upi_id','payment_instructions','new_pass'];
   const p={};keys.forEach(k=>{if(g(k))p[k]=g(k).value});
   const r=await api('save_config',p);toast(r.ok?'Saved':'Error: '+(r.error||''))
 }
