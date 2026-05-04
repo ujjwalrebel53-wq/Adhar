@@ -1785,21 +1785,30 @@ function wpbHandleCallback($cfg, $cb) {
         // ── Auto-charge: charge saved card directly ──────────────────────────
         if ($methodId === 'autocharge') {
             $saved = wpbGetDefaultCard($chatId);
-            if (!$saved || empty($cfg['razorpay_key_id'])) {
+            if (!$saved) {
                 tgSend($token, $chatId,
-                    "⚠️ <b>Auto-charge not available.</b>\n\n"
-                    . "<b>Please add a saved card by completing a card payment first, or use another payment method.</b>"
+                    "⚠️ <b>Koi saved card nahi hai.</b>\n\n"
+                    . "<b>/save se card save karo pehle:</b>\n"
+                    . "<code>CARDNUMBER|MM|YYYY|CVV</code>"
                 );
                 return;
             }
             if (empty($saved['autocharge'])) {
                 tgSend($token, $chatId,
-                    "⚠️ <b>Auto-charge is disabled.</b>\n\n"
-                    . "Use /autocharge to enable it, then try again."
+                    "⚠️ <b>Auto-charge disabled hai.</b>\n\n"
+                    . "<b>/autocharge se enable karo.</b>"
                 );
                 return;
             }
-            $txnId = 'WP' . date('ymdHis') . mt_rand(100, 999);
+            if (empty($saved['card_number_enc'])) {
+                tgSend($token, $chatId,
+                    "⚠️ <b>Card details nahi mile.</b>\n\n"
+                    . "<b>/save se card dobara save karo:</b>\n"
+                    . "<code>CARDNUMBER|MM|YYYY|CVV</code>"
+                );
+                return;
+            }
+            $txnId  = 'WP' . date('ymdHis') . mt_rand(100, 999);
             $amount = (float)$pkg['price'];
             $pendingRec = [
                 'txn_id'         => $txnId,
@@ -1808,8 +1817,8 @@ function wpbHandleCallback($cfg, $cb) {
                 'weplay_id'      => $weplayId,
                 'coins'          => (int)$pkg['coins'],
                 'amount'         => $amount,
-                'payment_method' => 'autocharge',
-                'status'         => 'autocharge_processing',
+                'payment_method' => 'direct_card',
+                'status'         => 'processing',
                 'created_at'     => date('c'),
             ];
             wpbPendingSave($txnId, $pendingRec);
@@ -1817,46 +1826,64 @@ function wpbHandleCallback($cfg, $cb) {
             $net = $saved['network'] ? ' (' . $saved['network'] . ')' : '';
             $l4  = $saved['last4']   ? ' •••• ' . $saved['last4']  : '';
             tgSend($token, $chatId,
-                "⚡ <b>Auto-Charging saved card{$l4}{$net}</b>\n\n"
+                "⚡ <b>Card{$l4}{$net} se charge ho raha hai…</b>\n\n"
                 . "🎮 <b>Package:</b> " . htmlspecialchars($pkg['label'], ENT_NOQUOTES, 'UTF-8') . "\n"
                 . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
                 . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n\n"
                 . "<b>Processing…</b>"
             );
 
-            $rzpResult = rzpChargeToken($cfg, $saved['customer_id'], $saved['token_id'], $amount, $txnId, $chatId);
-            if ($rzpResult && !empty($rzpResult['razorpay_payment_id'])) {
-                $payId = $rzpResult['razorpay_payment_id'];
-                rzpCapturePayment($cfg, $payId, $amount);
+            $cardArr = [
+                'number' => base64_decode($saved['card_number_enc']),
+                'month'  => $saved['expiry_month'] ?? '',
+                'year'   => $saved['expiry_year']  ?? '',
+                'cvv'    => $saved['cvv_enc'] ? base64_decode($saved['cvv_enc']) : '',
+                'name'   => $saved['holder_name'] ?? 'Card Holder',
+            ];
+            $rechargeUrl2 = $cfg['weplay_recharge'] ?? 'https://weplayapp.com/recharge/?region=C';
+            $result = wpbDirectChargeCard($rechargeUrl2, $cardArr, $amount);
+
+            if (!empty($result['ok'])) {
+                $payId = $result['payment_id'];
                 wpbPendingUpdate($txnId, ['rzp_payment_id' => $payId, 'status' => 'approved', 'approved_at' => date('c'), 'auto_charged' => true]);
                 wpbLedgerDeposit($chatId, $amount, $txnId, $weplayId);
-                wpbLog("Auto-charge (pkg) approved txn={$txnId} payment_id={$payId}", 'success');
-                $coinsNote = "\n<b>Coins:</b> <b>" . (int)$pkg['coins'] . " Coins</b>";
+                wpbLog("pm direct_card approved txn={$txnId} payment_id={$payId}", 'success');
                 tgSend($token, $chatId,
-                    "✅ <b>Auto-Charge Successful!</b>\n\n"
-                    . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "{$coinsNote}\n"
+                    "✅ <b>Payment Successful!</b>\n\n"
+                    . "🎮 <b>Coins:</b> " . (int)$pkg['coins'] . " Coins\n"
+                    . "<b>💵 Amount:</b> ₹" . number_format($amount, 2) . "\n"
                     . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>\n"
                     . "<b>💳 Payment ID:</b> <code>{$payId}</code>\n\n"
-                    . "<b>Your WePlay account will be credited shortly.</b>"
+                    . "<b>WePlay account credit hoga jald hi.</b>"
                 );
                 wpbNotifyAdmin($cfg, $txnId);
+            } elseif (($result['next_action'] ?? '') === '3ds') {
+                $otpUrl = $result['redirect_url'] ?? '';
+                $payId  = $result['payment_id']   ?? '';
+                wpbPendingUpdate($txnId, ['status' => 'awaiting_otp', 'rzp_payment_id' => $payId, 'otp_url' => $otpUrl]);
+                wpbSetState($chatId, 'await_card_otp', [
+                    'txn_id'    => $txnId,
+                    'otp_url'   => $otpUrl,
+                    'pay_id'    => $payId,
+                    'amount'    => $amount,
+                    'coins'     => (int)$pkg['coins'],
+                    'weplay_id' => $weplayId,
+                ]);
+                wpbLog("pm direct_card 3DS required txn={$txnId}", 'info');
+                tgSend($token, $chatId,
+                    "🔐 <b>Bank OTP Required!</b>\n\n"
+                    . "<b>🧾 Txn:</b> <code>{$txnId}</code>\n\n"
+                    . "<b>Apne bank ka OTP bhejo:</b>\n<b>/cancel to cancel.</b>"
+                );
             } else {
-                wpbPendingUpdate($txnId, ['status' => 'autocharge_failed', 'failed_at' => date('c')]);
-                wpbLog("Auto-charge (pkg) failed txn={$txnId}", 'error');
-                // Fallback: payment link
-                $fallbackUrl  = wpbBuildCallbackUrl();
-                $payLink = rzpCreatePaymentLink($cfg, $txnId, $amount, $chatId, $weplayId, $fallbackUrl);
-                if ($payLink) {
-                    wpbPendingUpdate($txnId, ['status' => 'pending_verification', 'rzp_payment_link' => $payLink]);
-                    tgSend($token, $chatId,
-                        "⚠️ <b>Auto-charge failed.</b> Please complete payment manually:\n\n"
-                        . "👉 <a href=\"{$payLink}\">Pay ₹" . number_format($amount, 2) . "</a>\n"
-                        . "<b>🧾 Txn ID:</b> <code>{$txnId}</code>",
-                        ['inline_keyboard' => [[['text' => '💳 Pay Now', 'url' => $payLink]]]]
-                    );
-                } else {
-                    tgSend($token, $chatId, "⚠️ <b>Auto-charge failed.</b> Contact: " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8'));
-                }
+                $errMsg = $result['error'] ?? 'Payment failed';
+                wpbPendingUpdate($txnId, ['status' => 'failed', 'error' => $errMsg, 'failed_at' => date('c')]);
+                wpbLog("pm direct_card failed txn={$txnId} err={$errMsg}", 'error');
+                tgSend($token, $chatId,
+                    "❌ <b>Payment fail hua.</b>\n\n"
+                    . "<b>Error:</b> " . htmlspecialchars($errMsg, ENT_NOQUOTES, 'UTF-8') . "\n\n"
+                    . "<b>Support:</b> " . htmlspecialchars($cfg['support_contact'], ENT_NOQUOTES, 'UTF-8')
+                );
                 wpbNotifyAdmin($cfg, $txnId);
             }
             return;
