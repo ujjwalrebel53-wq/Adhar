@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.RebelB2W" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">#FF6B1A</item>
+        <item name="colorPrimaryVariant">#CC5500</item>
+        <item name="colorOnPrimary">#000000</item>
+        <item name="colorSecondary">#39FF14</item>
+        <item name="colorOnSecondary">#000000</item>
+        <item name="android:windowBackground">#0e0e12</item>
+        <item name="android:statusBarColor">#0e0e12</item>
+        <item name="android:navigationBarColor">#0e0e12</item>
+    </style>
+</resources>
